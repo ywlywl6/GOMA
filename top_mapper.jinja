@@ -1,0 +1,15 @@
+# This file will be converted into a YAML file by Jinja2 templating.
+{{add_to_path(cwd() ~ '/inputs_my')}}
+{{add_to_path(cwd() ~ '/architecture')}}
+
+# Grab the necessary top keys from each file and put them here.
+# Note: we intentionally DO NOT include mapping.yaml here, so that
+# the Timeloop mapper explores the mapping space instead of using a
+# fixed mapping as input.
+architecture: {{include(arch|default('arch.yaml'), 'architecture')}}
+components:
+  version: 0.4
+  classes: {{include_all('_components/*.yaml', 'compound_components.classes')}}
+variables:    {{include('variables.yaml', 'variables')}}
+problem:      {{include(problem|default('problem.yaml'), 'problem')}}
+mapper:       {{include('mapper.yaml', 'mapper')}}

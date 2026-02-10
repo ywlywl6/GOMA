@@ -1,0 +1,31 @@
+problem:
+  version: 0.4
+  instance:
+    X: 16                   # Batch size
+
+    Y: 16                   # Input channels
+    Z: 16                   # Input height
+
+  shape:
+    data_spaces:
+    - name: Weights
+      projection:
+      - - - X
+      - - - Z
+
+    - name: Inputs
+      projection:
+      - - - Y
+      - - - Z
+
+    - name: Outputs
+      projection:
+      - - - X
+      - - - Y
+
+      read_write: true
+    dimensions:
+    - X
+    - Y
+    - Z
+

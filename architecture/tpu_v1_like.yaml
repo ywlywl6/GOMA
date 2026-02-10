@@ -1,0 +1,55 @@
+architecture:
+  # ============================================================
+  # Architecture Description (derived from inputs_my/arch.yaml)
+  # Config: TPU v1-like
+  # ============================================================
+  version: 0.4
+  nodes: # Top-level is hierarchical
+  - !Container # Top-level system
+    name: system
+
+  - !Component # DRAM main memory
+    name: DRAM
+    class: DRAM
+    attributes:
+      type: "DDR3"
+      width: 2048
+      datawidth: 8
+      depth: 2147483648
+
+  - !Container # Accelerator
+    name: eyeriss
+    attributes:
+      technology: "28nm"
+
+  - !Component # Global buffer for inputs & outputs
+    name: shared_glb
+    class: smartbuffer_SRAM
+    attributes:
+      depth: 1966080
+      width: 128
+      n_banks: 5
+      datawidth: 8
+
+  - !Container # PE Array 
+    name: PEy
+    spatial: {meshX: 256}
+
+  - !Container # PE Array 
+    name: PE
+    spatial: {meshY: 256}
+
+  - !Component # Output scratchpad
+    name: regfile
+    class: smartbuffer_RF
+    attributes:
+      depth: 2
+      width: 8
+      datawidth: 8
+
+  - !Component # MAC unit
+    name: mac
+    class: intmac
+    attributes:
+      multiplier_width: 8
+      adder_width: 16

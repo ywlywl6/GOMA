@@ -1,0 +1,25 @@
+problem:
+  version: 0.4
+  instance:
+    X: 1024
+    Y: 2048
+    Z: 8192
+  shape:
+    data_spaces:
+    - name: Weights
+      projection:
+      - - - X
+      - - - Z
+    - name: Inputs
+      projection:
+      - - - Y
+      - - - Z
+    - name: Outputs
+      projection:
+      - - - X
+      - - - Y
+      read_write: true
+    dimensions:
+    - X
+    - Y
+    - Z

@@ -1,0 +1,30 @@
+compound_components:
+  version: 0.4
+  classes:
+  - name: snn_compute
+    attributes:
+      technology: "must_specify"
+      width: "must_specify"
+      global_cycle_seconds: "must_specify"
+    subcomponents:
+    - name: intadder
+      class: aladdin_adder
+      attributes:
+        width: width
+    - name: mux
+      class: mux
+      attributes:
+        technology: technology
+        n_bits: width
+        n_mux_inputs: 2
+    actions:
+    - name: compute
+      subcomponents:
+      - name: intadder
+        actions: [{name: read}]
+      - name: mux
+        actions: [{name: read}]
+    - name: leak
+      subcomponents:
+      - name: intadder
+        actions: [{name: leak}]

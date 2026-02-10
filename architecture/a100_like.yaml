@@ -1,0 +1,55 @@
+architecture:
+  # ============================================================
+  # Architecture Description: Scaled A100-like (256x256)
+  # Scaling Factor: ~0.59x (from 432x256 to 256x256)
+  # ============================================================
+  version: 0.4
+  nodes: # Top-level is hierarchical
+  - !Container # Top-level system
+    name: system
+
+  - !Component # DRAM main memory (HBM2)
+    name: DRAM
+    class: DRAM
+    attributes:
+      type: "HBM2"          # A100 实际使用的显存类型
+      width: 2048
+      datawidth: 8
+      depth: 2147483648
+
+  - !Container # Accelerator
+    name: a100_scaled
+    attributes:
+      technology: "7nm"     # A100 工艺节点
+
+  - !Component # Global buffer (Merged L2 + L1, Scaled)
+    name: shared_glb
+    class: smartbuffer_SRAM
+    attributes:
+      depth: 2359296        # ~36MB Total Capacity / 128 bit width
+      width: 128            # 用户指定物理约束
+      n_banks: 288           # 8192depth
+      datawidth: 8         # FP16
+
+  - !Container # PE Array 
+    name: PEy
+    spatial: {meshX: 256}
+
+  - !Container # PE Array 
+    name: PE
+    spatial: {meshY: 256}
+
+  - !Component # Register File (Per PE)
+    name: regfile
+    class: smartbuffer_RF
+    attributes:
+      depth: 64            # 256 Bytes / 2 Bytes(16bit) = 128
+      width: 16             # 16-bit registers
+      datawidth: 8
+
+  - !Component # Compute Unit (Tensor Core equivalent part)
+    name: mac
+    class: intmac           
+    attributes:
+      multiplier_width: 8   # 基础 INT8 计算能力 (也可设16支持FP16)
+      adder_width: 16       

@@ -1,0 +1,50 @@
+architecture:
+  # ============================================================
+  # Architecture Description (split from arch_ref.yaml)
+  # ============================================================
+  version: 0.4
+  nodes: # Top-level is hierarchical
+  - !Container # Top-level system
+    name: system
+
+  - !Component # DRAM main memory
+    name: DRAM
+    class: DRAM
+    attributes:
+      type: "LPDDR4"
+      width: 2048
+      datawidth: 8
+      depth: 2147483648
+
+  - !Container # Eyeriss accelerator
+    name: eyeriss
+    attributes:
+      technology: "65nm"
+
+  - !Component # Global buffer for inputs & outputs
+    name: shared_glb
+    class: smartbuffer_SRAM
+    attributes:
+      depth: 16384
+      width: 64
+      n_banks: 32
+      datawidth: 8
+
+  - !Container # Each PE in the column receives a different filter row
+    name: PE
+    spatial: {meshX: 64}
+
+  - !Component # Output scratchpad
+    name: regfile
+    class: smartbuffer_SRAM
+    attributes:
+      depth: 64
+      width: 8
+      datawidth: 8
+
+  - !Component # MAC unit
+    name: mac
+    class: intmac
+    attributes:
+      multiplier_width: 8
+      adder_width: 16

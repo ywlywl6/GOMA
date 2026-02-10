@@ -1,0 +1,36 @@
+mapping:
+  - target: DRAM
+    type: temporal
+    permutation: [Y, X, Z]
+    factors: [X=2, Y=2, Z=2]
+
+
+  - target: shared_glb
+    type: temporal
+    factors: [X=2, Y=2, Z=2]
+    permutation: [X, Y, Z]
+
+  - target: shared_glb
+    type: dataspace
+    keep:
+    - Inputs
+    - Weights
+    bypass:
+    - Outputs
+
+  - target: PE
+    type: spatial
+    factors: [X=2, Y=2, Z=2]
+    permutation: [Z, X, Y]
+
+  - target: regfile
+    type: temporal
+    factors: [X=2, Y=2, Z=2]
+    permutation: [Z, Y, X]
+
+  - target: regfile
+    type: dataspace
+    keep:
+    - Weights
+    - Inputs
+    - Outputs
