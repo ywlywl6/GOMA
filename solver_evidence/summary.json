@@ -1,0 +1,43 @@
+{
+  "instances": 192,
+  "status_counts": {
+    "2": 192
+  },
+  "printed_gap_counts": {
+    "0.0000": 192
+  },
+  "nodes": {
+    "min": 1,
+    "median": 4592.0,
+    "max": 36032,
+    "total": 1385874
+  },
+  "solver_seconds_log": {
+    "min": 0.04,
+    "median": 0.31,
+    "max": 1.86,
+    "total": 80.05
+  },
+  "stage3_seconds_log": {
+    "min": 0.065856,
+    "median": 0.362352,
+    "max": 1.939732,
+    "total": 89.948686
+  },
+  "presolved_integer": {
+    "min": 57,
+    "median": 72.0,
+    "max": 84,
+    "total": 14043
+  },
+  "presolved_binary": {
+    "min": 37,
+    "median": 45.0,
+    "max": 51,
+    "total": 8723
+  },
+  "dataset": "edp_main",
+  "evaluation_cases": 24,
+  "model_variant": "review1_bugfix",
+  "objective": "Normalized dynamic energy including MACC, excluding leakage; pJ/MAC"
+}
