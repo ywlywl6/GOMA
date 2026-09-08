@@ -1,299 +1,758 @@
 # -*- coding: utf-8 -*-
-from typing import Dict, Tuple, Any
+"""Gurobi optimizer for the reviewed ``review1_bugfix`` GOMA model.
+
+This module implements the traffic and energy equations in
+the reviewed equations described in ``MODEL_NOTES.md``.  In particular, it keeps receiver-side
+and source-side traffic separate, derives reduction old-read traffic from
+ungated active-path geometry, and models the level-3 cross-SRAM-tile reuse
+indicator ``chi3``.
+
+The public ``build_model_full`` interface and its eight-element return tuple
+match the original public optimizer interface.  The objective contains
+normalized dynamic energy only.  Leakage remains a fixed reporting term
+because ``N_PE`` is fixed by the model constraints.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, Tuple
+
 import gurobipy as gp
 from gurobipy import GRB
 
-Dims = ('x', 'y', 'z')
 
-def _and_bin(m: gp.Model, b1: gp.Var, b2: gp.Var, name: str) -> gp.Var:
-    """w = b1 AND b2"""
-    w = m.addVar(vtype=GRB.BINARY, name=name)
-    m.addConstr(w <= b1)
-    m.addConstr(w <= b2)
-    m.addConstr(w >= b1 + b2 - 1)
-    return w
+Dims = ("x", "y", "z")
 
-def _and_bin_neg(m: gp.Model, b1: gp.Var, b2: gp.Var, name: str) -> gp.Var:
-    """w = b1 AND (1-b2)"""
-    w = m.addVar(vtype=GRB.BINARY, name=name)
-    # w <= b1; w <= 1-b2; w >= b1 - b2
-    m.addConstr(w <= b1)
-    m.addConstr(w <= 1 - b2)
-    m.addConstr(w >= b1 - b2)
-    return w
+# Normalized traffic variables can be O(1e-6), while their energy weights can
+# be O(1e2).  Writing their defining rows in milli-count units keeps absolute
+# feasibility residuals from becoming visible objective errors.
+_NORMALIZED_FLOW_SCALE = 1000.0
 
-def _gate_prod(m: gp.Model, b: gp.Var, x: gp.Var, ub_x: float, name: str) -> gp.Var:
-    """g = b * x, with 0 <= x <= ub_x"""
-    g = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=ub_x, name=name)
-    m.addConstr(g <= x)
-    m.addConstr(g <= b * ub_x)
-    m.addConstr(g >= x - (1 - b) * ub_x)
-    return g
 
-def build_model_full(cfg: Dict[str, Any], params: Dict[str, Any] = None) -> Tuple[
+def _and_bins(
+    model: gp.Model,
+    bits: Iterable[gp.Var],
+    name: str,
+) -> gp.Var:
+    """Return a binary variable equal to the AND of positive literals."""
+    operands = tuple(bits)
+    if not operands:
+        raise ValueError("_and_bins requires at least one operand")
+    result = model.addVar(vtype=GRB.BINARY, name=name)
+    for index, bit in enumerate(operands):
+        model.addConstr(result <= bit, name=f"{name}_ub_{index}")
+    model.addConstr(
+        result >= gp.quicksum(operands) - (len(operands) - 1),
+        name=f"{name}_lb",
+    )
+    return result
+
+
+def _and_bin_neg(
+    model: gp.Model,
+    positive: gp.Var,
+    negative: gp.Var,
+    name: str,
+) -> gp.Var:
+    """Return ``positive AND (NOT negative)``."""
+    result = model.addVar(vtype=GRB.BINARY, name=name)
+    model.addConstr(result <= positive, name=f"{name}_ub_pos")
+    model.addConstr(result <= 1 - negative, name=f"{name}_ub_neg")
+    model.addConstr(result >= positive - negative, name=f"{name}_lb")
+    return result
+
+
+def _nor_bins(
+    model: gp.Model,
+    first: gp.Var,
+    second: gp.Var,
+    name: str,
+) -> gp.Var:
+    """Return ``(NOT first) AND (NOT second)``."""
+    result = model.addVar(vtype=GRB.BINARY, name=name)
+    model.addConstr(result <= 1 - first, name=f"{name}_ub_first")
+    model.addConstr(result <= 1 - second, name=f"{name}_ub_second")
+    model.addConstr(result >= 1 - first - second, name=f"{name}_lb")
+    return result
+
+
+def _gate_product(
+    model: gp.Model,
+    gate: gp.Var,
+    value: gp.Var,
+    ub_value: float,
+    name: str,
+) -> gp.Var:
+    """Model ``result = gate * value`` for ``0 <= value <= ub_value``.
+
+    The convex-hull linearization is already well scaled when ``ub_value`` is
+    at most one.  For larger domains, indicator constraints avoid injecting
+    ``ub_value`` as a Big-M matrix coefficient.
+    """
+    use_indicator = float(ub_value) > 1.0
+    result_vtype = (
+        value.VType
+        if use_indicator and value.VType in (GRB.INTEGER, GRB.BINARY)
+        else GRB.CONTINUOUS
+    )
+    result = model.addVar(
+        vtype=result_vtype,
+        lb=0.0,
+        ub=float(ub_value),
+        name=name,
+    )
+    if not use_indicator:
+        # These variables are normalized counts and can be much smaller than
+        # one, while their objective weights can be hundreds of energy units.
+        # Express the identical hull in milli-count units so a row residual at
+        # FeasibilityTol cannot be magnified into a visible energy error.
+        model.addConstr(
+            _NORMALIZED_FLOW_SCALE * result <= _NORMALIZED_FLOW_SCALE * value,
+            name=f"{name}_ub_value",
+        )
+        model.addConstr(
+            _NORMALIZED_FLOW_SCALE * result
+            <= _NORMALIZED_FLOW_SCALE * float(ub_value) * gate,
+            name=f"{name}_ub_gate",
+        )
+        model.addConstr(
+            _NORMALIZED_FLOW_SCALE * result
+            >= _NORMALIZED_FLOW_SCALE * value
+            - _NORMALIZED_FLOW_SCALE * float(ub_value) * (1 - gate),
+            name=f"{name}_lb",
+        )
+    else:
+        # Preserve integrality when the gated value is integral.  Otherwise a
+        # continuous result could drift within FeasibilityTol and the error can
+        # be amplified by downstream energy coefficients.
+        model.addGenConstrIndicator(
+            gate,
+            0,
+            result == 0.0,
+            name=f"{name}_off",
+        )
+        model.addGenConstrIndicator(
+            gate,
+            1,
+            result == value,
+            name=f"{name}_on",
+        )
+    return result
+
+
+def _is_one_indicator(
+    model: gp.Model,
+    value: gp.Var,
+    ub_value: int,
+    name: str,
+) -> gp.Var:
+    """Return a binary variable that is one exactly when integer ``value`` is 1."""
+    indicator = model.addVar(vtype=GRB.BINARY, name=name)
+    # value has lb=1.  Indicators encode both directions without using its
+    # potentially large upper bound as a Big-M coefficient.
+    model.addGenConstrIndicator(
+        indicator,
+        1,
+        value == 1,
+        name=f"{name}_force_one",
+    )
+    model.addGenConstrIndicator(
+        indicator,
+        0,
+        value >= 2,
+        name=f"{name}_force_nonunit",
+    )
+    return indicator
+
+
+def build_model_full(
+    cfg: Dict[str, Any],
+    params: Dict[str, Any] | None = None,
+) -> Tuple[
     gp.Model,
-    Dict[Tuple[int, str], gp.Var], Dict[Tuple[int, str], gp.Var], Dict[Tuple[int, str], gp.Var],
-    Dict[str, gp.Var], Dict[str, gp.Var], Dict[str, gp.Var], Dict[str, gp.Var]
+    Dict[Tuple[int, str], gp.Var],
+    Dict[Tuple[int, str], gp.Var],
+    Dict[Tuple[int, str], gp.Var],
+    Dict[str, gp.Var],
+    Dict[str, gp.Var],
+    Dict[str, gp.Var],
+    Dict[str, gp.Var],
 ]:
-    """
-    返回:
-      - m: gurobi Model
-      - L[(p,i)], k[(p,i)], y[(p,i)]  (p=1,2,3 / p=0..3 / p=1,2,3)
-      - B1[i], B3[i]  驻留开关 (binary)
-      - a01[i], a12[i] 行走轴 one-hot (binary, sum=1)
-    目标函数:  \bar E^{(src-1)} + \bar E^{(src-3)} + \bar E^{(src-4)} + \bar E^{(4)}
-      （均为归一化/每体素能量，见 §4.2）
-    """
-    # ---- unpack ----
-    L0 = cfg['L0']                          # {'x':..,'y':..,'z':..}
-    C1, C3 = cfg['C1'], cfg['C3']           # SRAM/regfile capacity
-    N_PE = cfg['N_PE']                      # PE 数
-    # energies (DeviceParams 命名对齐)
-    E_DDR_r = cfg['E_DDR_r']; E_DDR_w = cfg['E_DDR_w']
-    E_SRAM_r = cfg['E_SRAM_r']; E_SRAM_w = cfg['E_SRAM_w']
-    E_RF_r = cfg['E_RF_r'];   E_RF_w = cfg['E_RF_w']
-    E_MACC = cfg['E_MACC']
+    r"""Build the complete reviewed non-convex integer optimization model.
 
-    # ---- model ----
-    m = gp.Model("mapper_full_axes_B")
-    m.Params.NonConvex = 2
+    Returns ``(model, L, k, y, B1, B3, a01, a12)`` exactly like the submission
+    optimizer.  Here ``k[(p,d)]`` is :math:`\hat L_d^{(p-(p+1))}` and
+    ``y[(p,d)]`` is ``1 / L[(p,d)]``.
+    """
+    L0_raw = cfg["L0"]
+    L0 = {d: int(L0_raw[d]) for d in Dims}
+    if any(L0[d] <= 0 or L0[d] != L0_raw[d] for d in Dims):
+        raise ValueError("cfg['L0'] must contain positive integer x/y/z lengths")
+
+    C1 = float(cfg["C1"])
+    C3 = float(cfg["C3"])
+    N_PE = int(cfg["N_PE"])
+    if C1 < 0 or C3 < 0:
+        raise ValueError("C1 and C3 must be non-negative")
+    if N_PE <= 0 or N_PE != cfg["N_PE"]:
+        raise ValueError("N_PE must be a positive integer")
+
+    E_DDR_r = float(cfg["E_DDR_r"])
+    E_DDR_w = float(cfg["E_DDR_w"])
+    E_SRAM_r = float(cfg["E_SRAM_r"])
+    E_SRAM_w = float(cfg["E_SRAM_w"])
+    E_RF_r = float(cfg["E_RF_r"])
+    E_RF_w = float(cfg["E_RF_w"])
+    E_MACC = float(cfg["E_MACC"])
+
+    model = gp.Model("mapper_review1_bugfix")
+    model.Params.NonConvex = 2
     if params:
-        for kpar, vpar in params.items():
-            setattr(m.Params, kpar, vpar)
+        for key, value in params.items():
+            setattr(model.Params, key, value)
 
-    # ---- vars: L/k/y ----
+    # ------------------------------------------------------------------
+    # Hierarchical tile lengths, adjacent ratios, and public reciprocals.
+    # ------------------------------------------------------------------
     L: Dict[Tuple[int, str], gp.Var] = {}
     k: Dict[Tuple[int, str], gp.Var] = {}
     y: Dict[Tuple[int, str], gp.Var] = {}
 
-    for p in (1, 2, 3):
-        for i in Dims:
-            L[(p, i)] = m.addVar(vtype=GRB.INTEGER, lb=1, ub=L0[i], name=f"L_{p}_{i}")
-            y[(p, i)] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"y_{p}_{i}")  # y=1/L
+    for level in (1, 2, 3):
+        for d in Dims:
+            L[(level, d)] = model.addVar(
+                vtype=GRB.INTEGER,
+                lb=1,
+                ub=L0[d],
+                name=f"L_{level}_{d}",
+            )
+            y[(level, d)] = model.addVar(
+                vtype=GRB.CONTINUOUS,
+                lb=1.0 / float(L0[d]),
+                ub=1.0,
+                name=f"y_{level}_{d}",
+            )
 
-    for p in (0, 1, 2, 3):
-        for i in Dims:
-            k[(p, i)] = m.addVar(vtype=GRB.INTEGER, lb=1, ub=L0[i], name=f"k_{p}_{i}")
+    for stage in (0, 1, 2, 3):
+        for d in Dims:
+            k[(stage, d)] = model.addVar(
+                vtype=GRB.INTEGER,
+                lb=1,
+                ub=L0[d],
+                name=f"k_{stage}_{d}",
+            )
 
-    # ---- B 矩阵 (only L1 & L3 are switchable per §1.2/§4.1) ----
-    B1 = {i: m.addVar(vtype=GRB.BINARY, name=f"B1_{i}") for i in Dims}
-    B3 = {i: m.addVar(vtype=GRB.BINARY, name=f"B3_{i}") for i in Dims}
+    B1 = {d: model.addVar(vtype=GRB.BINARY, name=f"B1_{d}") for d in Dims}
+    B3 = {d: model.addVar(vtype=GRB.BINARY, name=f"B3_{d}") for d in Dims}
+    a01 = {d: model.addVar(vtype=GRB.BINARY, name=f"a01_{d}") for d in Dims}
+    a12 = {d: model.addVar(vtype=GRB.BINARY, name=f"a12_{d}") for d in Dims}
+    model.addConstr(gp.quicksum(a01.values()) == 1, name="onehot_a01")
+    model.addConstr(gp.quicksum(a12.values()) == 1, name="onehot_a12")
 
-    # ---- 行走轴 one-hot: alpha_{0-1}, alpha_{1-2} ----
-    a01 = {i: m.addVar(vtype=GRB.BINARY, name=f"a01_{i}") for i in Dims}
-    a12 = {i: m.addVar(vtype=GRB.BINARY, name=f"a12_{i}") for i in Dims}
-    m.addConstr(gp.quicksum(a01.values()) == 1, name="onehot_a01")
-    m.addConstr(gp.quicksum(a12.values()) == 1, name="onehot_a12")
+    model.update()
 
-    m.update()
+    for d in Dims:
+        model.addQConstr(
+            k[(0, d)] * L[(1, d)] == L0[d],
+            name=f"hierarchy_01_{d}",
+        )
+        model.addQConstr(
+            k[(1, d)] * L[(2, d)] == L[(1, d)],
+            name=f"hierarchy_12_{d}",
+        )
+        model.addQConstr(
+            k[(2, d)] * L[(3, d)] == L[(2, d)],
+            name=f"hierarchy_23_{d}",
+        )
+        model.addConstr(L[(3, d)] == k[(3, d)], name=f"hierarchy_34_{d}")
 
-    # ---- hierarchy / divisibility ----  (§3.3)
-    for i in Dims:
-        m.addQConstr(L0[i] == k[(0, i)] * L[(1, i)], name=f"div_0_{i}")  # L0 = k0 * L1
-        m.addQConstr(L[(1, i)] == k[(1, i)] * L[(2, i)], name=f"div_1_{i}")  # L1 = k1 * L2
-        m.addQConstr(L[(2, i)] == k[(2, i)] * L[(3, i)], name=f"div_2_{i}")  # L2 = k2 * L3
-        m.addConstr(L[(3, i)] == k[(3, i)], name=f"anchor_3_{i}")            # L3 = k3 (L4=1)
+    for level in (1, 2, 3):
+        for d in Dims:
+            model.addQConstr(
+                y[(level, d)] * L[(level, d)] == 1.0,
+                name=f"reciprocal_L_{level}_{d}",
+            )
 
-    # ---- reciprocal constraints: y * L = 1 ----  (Objective must be linear/quadratic)
-    for p in (1, 2, 3):
-        for i in Dims:
-            m.addQConstr(y[(p, i)] * L[(p, i)] == 1.0, name=f"inv_L_{p}_{i}")  # y=1/L
+    invk2: Dict[str, gp.Var] = {}
+    reciprocal_L3k1: Dict[str, gp.Var] = {}
+    reciprocal_L3k1k0: Dict[str, gp.Var] = {}
+    for d in Dims:
+        invk2[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=1.0 / float(L0[d]),
+            ub=1.0,
+            name=f"inv_k2_{d}",
+        )
+        model.addQConstr(
+            invk2[d] * k[(2, d)] == 1.0,
+            name=f"reciprocal_k2_{d}",
+        )
 
-    # for rho in src-1 (z uses k0_z): v0z = 1 / k0_z
-    v0z = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name="v0_z")
-    m.addQConstr(v0z * k[(0, 'z')] == 1.0, name="inv_k0_z")
+        product_L3k1 = model.addVar(
+            vtype=GRB.INTEGER,
+            lb=1,
+            ub=L0[d],
+            name=f"product_L3k1_{d}",
+        )
+        product_L3k1k0 = model.addVar(
+            vtype=GRB.INTEGER,
+            lb=1,
+            ub=L0[d],
+            name=f"product_L3k1k0_{d}",
+        )
+        reciprocal_L3k1[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=1.0 / float(L0[d]),
+            ub=1.0,
+            name=f"inv_L3k1_{d}",
+        )
+        reciprocal_L3k1k0[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=1.0 / float(L0[d]),
+            ub=1.0,
+            name=f"inv_L3k1k0_{d}",
+        )
+        model.addQConstr(
+            product_L3k1 == L[(3, d)] * k[(1, d)],
+            name=f"define_product_L3k1_{d}",
+        )
+        model.addQConstr(
+            product_L3k1k0 == product_L3k1 * k[(0, d)],
+            name=f"define_product_L3k1k0_{d}",
+        )
+        model.addQConstr(
+            reciprocal_L3k1[d] * product_L3k1 == 1.0,
+            name=f"reciprocal_product_L3k1_{d}",
+        )
+        model.addQConstr(
+            reciprocal_L3k1k0[d] * product_L3k1k0 == 1.0,
+            name=f"reciprocal_product_L3k1k0_{d}",
+        )
 
-    # inv k1, k2 for later usages
-    invk1 = {i: m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"inv_k1_{i}") for i in Dims}
-    invk2 = {i: m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"inv_k2_{i}") for i in Dims}
-    for i in Dims:
-        m.addQConstr(invk1[i] * k[(1, i)] == 1.0, name=f"invk1_{i}")
-        m.addQConstr(invk2[i] * k[(2, i)] == 1.0, name=f"invk2_{i}")
+    # ---------------------------------------------------------------
+    # Walking axes after unit-trip temporal loops have been removed.
+    # ---------------------------------------------------------------
+    unit_k0 = {
+        d: _is_one_indicator(model, k[(0, d)], L0[d], f"unit_k0_{d}")
+        for d in Dims
+    }
+    unit_k1 = {
+        d: _is_one_indicator(model, k[(1, d)], L0[d], f"unit_k1_{d}")
+        for d in Dims
+    }
+    all_unit_01 = _and_bins(model, unit_k0.values(), "all_unit_01")
+    all_unit_12 = _and_bins(model, unit_k1.values(), "all_unit_12")
 
-    # r3k1 = 1/(L3 * k1) to avoid triple products in src-3 denominator
-    r3k1 = {}
-    for i in Dims:
-        t3k1 = m.addVar(vtype=GRB.INTEGER, lb=1, ub=L0[i] * L0[i], name=f"t3k1_{i}")
-        r3k1[i] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"r3k1_{i}")
-        m.addQConstr(L[(3, i)] * k[(1, i)] == t3k1, name=f"mul_L3_k1_{i}")
-        m.addQConstr(r3k1[i] * t3k1 == 1.0, name=f"inv_L3k1_{i}")
+    for d in Dims:
+        # A non-degenerate stage may select only a non-unit loop.
+        model.addConstr(
+            a01[d] <= 1 - unit_k0[d] + all_unit_01,
+            name=f"physical_a01_{d}",
+        )
+        model.addConstr(
+            a12[d] <= 1 - unit_k1[d] + all_unit_12,
+            name=f"physical_a12_{d}",
+        )
+        # Reviewed convention: a fully degenerate stage 1--2 inherits a01.
+        model.addConstr(
+            a12[d] - a01[d] <= 1 - all_unit_12,
+            name=f"canonical_a12_upper_{d}",
+        )
+        model.addConstr(
+            a01[d] - a12[d] <= 1 - all_unit_12,
+            name=f"canonical_a12_lower_{d}",
+        )
 
-    # ---- capacity constraints (SRAM / regfile) ---- (§3.1, with bypass)
-    # C^(p) >= B_y^(p)*L_x^(p)L_z^(p) + B_x^(p)*L_y^(p)L_z^(p) + B_z^(p)*L_x^(p)L_y^(p)
-    def _add_capacity_constr(
-        p: int,
-        C: float,
-        Bp: Dict[str, gp.Var],
+    # The patch does not need a physical axis when stage 0--1 is all-unit.
+    # Select x deterministically to satisfy the one-hot public interface.
+    model.addConstr(a01["x"] >= all_unit_01, name="canonical_all_unit_a01_x")
+
+    # chi3[d] = [d=a01] [d=a12] product_{u!=d} [k1[u]=1].
+    chi3: Dict[str, gp.Var] = {}
+    for d in Dims:
+        orthogonal = tuple(u for u in Dims if u != d)
+        chi3[d] = _and_bins(
+            model,
+            (a01[d], a12[d], unit_k1[orthogonal[0]], unit_k1[orthogonal[1]]),
+            f"chi3_{d}",
+        )
+
+    # ------------------------------------------
+    # Capacity and full-PE-utilization limits.
+    # ------------------------------------------
+    def add_capacity_constraint(
+        level: int,
+        capacity: float,
+        residency: Dict[str, gp.Var],
         name: str,
     ) -> None:
-        Lx, Ly, Lz = L[(p, 'x')], L[(p, 'y')], L[(p, 'z')]
-        ub_xz = float(L0['x'] * L0['z'])
-        ub_yz = float(L0['y'] * L0['z'])
-        ub_xy = float(L0['x'] * L0['y'])
+        if capacity == 0.0:
+            # Every physical footprint is at least one word, hence zero
+            # capacity permits only complete bypass at this level.
+            for d in Dims:
+                model.addConstr(
+                    residency[d] == 0,
+                    name=f"{name}_zero_{d}",
+                )
+            return
 
-        # 投影面积（面法向分别为 y/x/z）
-        A_y = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=ub_xz, name=f"A_{p}_y")
-        A_x = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=ub_yz, name=f"A_{p}_x")
-        A_z = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=ub_xy, name=f"A_{p}_z")
-        m.addQConstr(A_y == Lx * Lz, name=f"def_A_{p}_y")
-        m.addQConstr(A_x == Ly * Lz, name=f"def_A_{p}_x")
-        m.addQConstr(A_z == Lx * Ly, name=f"def_A_{p}_z")
+        # For datum d, its physical footprint spans the other two axes.  Gate
+        # one length with indicators and multiply it by the other length.  This
+        # is exactly B[d] * L[u] * L[v], but avoids area upper bounds and Big-M
+        # coefficients as large as L0[u] * L0[v].
+        footprint_axes = {
+            "x": ("y", "z"),
+            "y": ("x", "z"),
+            "z": ("x", "y"),
+        }
 
-        # 旁路 (B=0) 时不计入容量；驻留 (B=1) 时计入对应投影面积
-        occ_y = _gate_prod(m, Bp['y'], A_y, ub_xz, name=f"occ_{p}_y")
-        occ_x = _gate_prod(m, Bp['x'], A_x, ub_yz, name=f"occ_{p}_x")
-        occ_z = _gate_prod(m, Bp['z'], A_z, ub_xy, name=f"occ_{p}_z")
-        m.addConstr(occ_y + occ_x + occ_z <= C, name=name)
+        # Measure occupied area in scaled word units.  sqrt(C) balances the
+        # quadratic coefficient 1/scale against the capacity RHS C/scale; it
+        # changes only numerical units, not the feasible mappings.
+        scale = max(1.0, math.sqrt(float(capacity)))
+        scaled_capacity = float(capacity) / scale
+        occupied_scaled: Dict[str, gp.Var] = {}
 
-    _add_capacity_constr(p=1, C=C1, Bp=B1, name="cap_lvl1")
-    _add_capacity_constr(p=3, C=C3, Bp=B3, name="cap_lvl3")
+        for d, (u, v) in footprint_axes.items():
+            selected_u = model.addVar(
+                vtype=GRB.CONTINUOUS,
+                lb=0.0,
+                ub=float(L0[u]),
+                name=f"selected_length_{level}_{d}",
+            )
+            model.addGenConstrIndicator(
+                residency[d],
+                0,
+                selected_u == 0.0,
+                name=f"selected_length_{level}_{d}_off",
+            )
+            model.addGenConstrIndicator(
+                residency[d],
+                1,
+                selected_u == L[(level, u)],
+                name=f"selected_length_{level}_{d}_on",
+            )
 
-    # ---- PE resource: k2x*k2y*k2z == N_PE ---- (§3.2)
-    k2x, k2y, k2z = k[(2, 'x')], k[(2, 'y')], k[(2, 'z')]
-    t12 = m.addVar(vtype=GRB.INTEGER, lb=1, ub=max(1, N_PE), name="t_pe_xy")
-    m.addQConstr(k2x * k2y == t12, name="pe_xy")
-    m.addQConstr(t12 * k2z == N_PE, name="pe_xyz")
+            occupied_scaled[d] = model.addVar(
+                vtype=GRB.CONTINUOUS,
+                lb=0.0,
+                ub=scaled_capacity,
+                name=f"occupied_scaled_{level}_{d}",
+            )
+            model.addQConstr(
+                occupied_scaled[d]
+                == selected_u * L[(level, v)] / scale,
+                name=f"define_occupied_scaled_{level}_{d}",
+            )
 
-    # -------------------------------
-    #   Objective: §4.2  (normalized)
-    # -------------------------------
-    obj = gp.LinExpr(0.0)
+        model.addConstr(
+            gp.quicksum(occupied_scaled.values()) <= scaled_capacity,
+            name=name,
+        )
 
-    # === 准备工作: 辅助变量构建 ===
+    add_capacity_constraint(1, C1, B1, "capacity_level_1")
+    add_capacity_constraint(3, C3, B3, "capacity_level_3")
 
-    # 1. Src-1 辅助变量: w01 (B1 & a01), phi01 (B1 & ~a01 & y1)
-    w01_alpha = {}
-    w01_bg = {}
-    phi01_bg = {}
-    for i in Dims:
-        w01_alpha[i] = _and_bin(m, B1[i], a01[i], f"w01a_{i}")
-        w01_bg[i] = _and_bin_neg(m, B1[i], a01[i], f"w01bg_{i}")
-        phi01_bg[i] = _gate_prod(m, w01_bg[i], y[(1, i)], 1.0, f"phi01bg_{i}")
+    product_k2_xy = model.addVar(
+        vtype=GRB.INTEGER,
+        lb=1,
+        ub=max(1, N_PE),
+        name="product_k2_xy",
+    )
+    model.addQConstr(
+        product_k2_xy == k[(2, "x")] * k[(2, "y")],
+        name="pe_product_xy",
+    )
+    model.addQConstr(
+        product_k2_xy * k[(2, "z")] == N_PE,
+        name="pe_product_xyz",
+    )
 
-    # 2. Src-3 辅助变量: g3 (B3 & a12), phi3
-    g3_alpha, g3_bg, phi3_alpha, phi3_bg = {}, {}, {}, {}
-    for i in Dims:
-        g3_alpha[i] = _and_bin(m, B3[i], a12[i], f"g3a_{i}")
-        g3_bg[i] = _and_bin_neg(m, B3[i], a12[i], f"g3bg_{i}")
-        phi3_alpha[i] = _gate_prod(m, g3_alpha[i], r3k1[i], 1.0, f"phi3a_{i}")
-        phi3_bg[i] = _gate_prod(m, g3_bg[i], y[(3, i)], 1.0, f"phi3bg_{i}")
+    # -----------------------------------------------------------------
+    # src--1: normalized receiver/source traffic and reduction boundary.
+    # -----------------------------------------------------------------
+    count1: Dict[str, gp.Var] = {}
+    for d in Dims:
+        resident_alpha = _and_bins(model, (B1[d], a01[d]), f"src1_resident_alpha_{d}")
+        resident_background = _and_bin_neg(
+            model,
+            B1[d],
+            a01[d],
+            f"src1_resident_background_{d}",
+        )
+        background_count = _gate_product(
+            model,
+            resident_background,
+            y[(1, d)],
+            1.0,
+            f"src1_background_count_{d}",
+        )
+        count1[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=0.0,
+            ub=1.0,
+            name=f"Nnorm_receiver_src1_{d}",
+        )
+        model.addConstr(
+            _NORMALIZED_FLOW_SCALE * count1[d]
+            == _NORMALIZED_FLOW_SCALE
+            * (
+                resident_alpha * (1.0 / float(L0[d]))
+                + background_count
+            ),
+            name=f"define_Nnorm_receiver_src1_{d}",
+        )
 
-        # 3. Src-3 计数与来源切换: counts3, tau3 (B1 * counts3)
-    tau3counts_B1 = {}
-    counts3_map = {}
-    for i in Dims:
-        counts3 = phi3_alpha[i] + phi3_bg[i]
-        counts3_map[i] = counts3
-        tau3 = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"tau3cntB1_{i}")
-        # tau3 = B1 * counts3 (Big-M linearization, M=1)
-        m.addConstr(tau3 <= counts3)
-        m.addConstr(tau3 <= B1[i])
-        m.addConstr(tau3 >= counts3 - (1 - B1[i]))
-        tau3counts_B1[i] = tau3
+    old_count1_z = model.addVar(
+        vtype=GRB.CONTINUOUS,
+        lb=0.0,
+        ub=1.0,
+        name="Nnorm_oldread_src1_z",
+    )
+    model.addConstr(
+        _NORMALIZED_FLOW_SCALE * old_count1_z
+        == _NORMALIZED_FLOW_SCALE
+        * (count1["z"] - B1["z"] / float(L0["z"])),
+        name="define_Nnorm_oldread_src1_z",
+    )
 
-    # =========================================================
-    # (1) Src-1: 上级→SRAM (§2.1, §4.2-1)
-    # =========================================================
-    # X/Y: 能量 = counts * (E_DDR_r + E_SRAM_w)
-    for i in ('x', 'y'):
-        counts = w01_alpha[i] * (1.0 / float(L0[i])) + phi01_bg[i]
-        obj += (E_DDR_r + E_SRAM_w) * counts
+    E_src1 = gp.LinExpr(0.0)
+    for d in ("x", "y"):
+        E_src1 += (E_DDR_r + E_SRAM_w) * count1[d]
+    E_src1 += E_DDR_w * count1["z"]
+    E_src1 += (E_DDR_r + E_SRAM_w) * old_count1_z
 
-    # Z: 特殊处理 rho = 1 - 1/k0_z = 1 - v0z
-    # E_z = counts_z * E_DDR_w + (counts_z_eff_read) * (E_DDR_r + E_SRAM_w)
-    # 其中 counts_z_eff_read = w01_alpha/L0 + phi01_bg * rho
-    counts_z = w01_alpha['z'] * (1.0 / float(L0['z'])) + phi01_bg['z']
-    obj += E_DDR_w * counts_z
-    # 只有 bypass 部分 (phi01_bg) 受 rho 影响; 列首 (w01_alpha) 总是 1/L0
-    # 修正 src-1 z轴: 若行走轴(w01_alpha=1)则 rho=0, 该项为0; 若 bypass(phi01_bg=1)则 rho=1-v0z
-    # 原代码错误地加上了 w01_alpha 部分 (相当于隐含 rho=1)
-    obj += (E_DDR_r + E_SRAM_w) * (phi01_bg['z'] * (1.0 - v0z))
+    # -----------------------------------------------------------------
+    # src--3: receiver traffic, source traffic, chi3, and path rho.
+    # -----------------------------------------------------------------
+    receiver3: Dict[str, gp.Var] = {}
+    source3: Dict[str, gp.Var] = {}
+    source3_sram: Dict[str, gp.Var] = {}
+    for d in Dims:
+        alpha_without_chi = model.addVar(
+            vtype=GRB.BINARY,
+            name=f"a12_without_chi3_{d}",
+        )
+        model.addConstr(
+            alpha_without_chi == a12[d] - chi3[d],
+            name=f"define_a12_without_chi3_{d}",
+        )
+        case_chi = _and_bins(model, (B3[d], chi3[d]), f"src3_case_chi_{d}")
+        case_alpha = _and_bins(
+            model,
+            (B3[d], alpha_without_chi),
+            f"src3_case_alpha_{d}",
+        )
+        case_background = _and_bin_neg(
+            model,
+            B3[d],
+            a12[d],
+            f"src3_case_background_{d}",
+        )
+        model.addConstr(
+            case_chi + case_alpha + case_background == B3[d],
+            name=f"src3_case_partition_{d}",
+        )
 
-    # =========================================================
-    # (2) Src-3: 上级→regfile (§2.2, §4.2-2)
-    # =========================================================
+        count_chi = _gate_product(
+            model,
+            case_chi,
+            reciprocal_L3k1k0[d],
+            1.0,
+            f"src3_receiver_chi_count_{d}",
+        )
+        count_alpha = _gate_product(
+            model,
+            case_alpha,
+            reciprocal_L3k1[d],
+            1.0,
+            f"src3_receiver_alpha_count_{d}",
+        )
+        count_background = _gate_product(
+            model,
+            case_background,
+            y[(3, d)],
+            1.0,
+            f"src3_receiver_background_count_{d}",
+        )
+        receiver3[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=0.0,
+            ub=1.0,
+            name=f"Nnorm_receiver_src3_{d}",
+        )
+        model.addConstr(
+            _NORMALIZED_FLOW_SCALE * receiver3[d]
+            == _NORMALIZED_FLOW_SCALE
+            * (count_chi + count_alpha + count_background),
+            name=f"define_Nnorm_receiver_src3_{d}",
+        )
 
-    # --- X/Y 轴 (无 rho 修正, 线性/双线性) ---
-    for i in ('x', 'y'):
-        c3 = counts3_map[i]
-        # Upstream (RegFile Write)
-        obj += E_RF_w * c3
-        # Downstream (SRAM/DDR Read via invk2)
-        # 若 B1=1 (SRAM): E_SRAM_r; 若 B1=0 (DDR): E_DDR_r
-        obj += E_DDR_r * invk2[i] * c3
-        obj += (E_SRAM_r - E_DDR_r) * invk2[i] * tau3counts_B1[i]
+        source3[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=0.0,
+            ub=1.0,
+            name=f"Nnorm_source_src3_{d}",
+        )
+        model.addQConstr(
+            _NORMALIZED_FLOW_SCALE * source3[d] * k[(2, d)]
+            == _NORMALIZED_FLOW_SCALE * receiver3[d],
+            name=f"define_Nnorm_source_src3_{d}",
+        )
+        source3_sram[d] = _gate_product(
+            model,
+            B1[d],
+            source3[d],
+            1.0,
+            f"Nnorm_source_src3_sram_{d}",
+        )
 
-    # --- Z 轴 (含 rho 修正) ---
-    # 逻辑推导:
-    # E_src3_z = counts3 * [ rho*E_RF_w + (E_src_w + rho*E_src_r)/k2 ]
-    # 提取公因式 rho: = counts3*rho * (E_RF_w + E_src_r/k2) + counts3 * (E_src_w/k2)
-    # 代换 rho*counts3 = counts3 - CF_z (CF_z 为扣除项)
-    # CF_z = B3_z * [ a12_z*(1/L0) + (1-a12_z)*(k2/L0) ]
+    B3_k2_z = _gate_product(
+        model,
+        B3["z"],
+        k[(2, "z")],
+        float(L0["z"]),
+        "B3_times_k2_z",
+    )
+    old_receiver3_z = model.addVar(
+        vtype=GRB.CONTINUOUS,
+        lb=0.0,
+        ub=1.0,
+        name="Nnorm_oldread_receiver_src3_z",
+    )
+    old_source3_z = model.addVar(
+        vtype=GRB.CONTINUOUS,
+        lb=0.0,
+        ub=1.0,
+        name="Nnorm_oldread_source_src3_z",
+    )
+    model.addConstr(
+        _NORMALIZED_FLOW_SCALE * old_receiver3_z
+        == _NORMALIZED_FLOW_SCALE
+        * (receiver3["z"] - B3_k2_z / float(L0["z"])),
+        name="define_Nnorm_oldread_receiver_src3_z",
+    )
+    model.addConstr(
+        _NORMALIZED_FLOW_SCALE * old_source3_z
+        == _NORMALIZED_FLOW_SCALE
+        * (source3["z"] - B3["z"] / float(L0["z"])),
+        name="define_Nnorm_oldread_source_src3_z",
+    )
+    old_source3_sram_z = _gate_product(
+        model,
+        B1["z"],
+        old_source3_z,
+        1.0,
+        "Nnorm_oldread_source_src3_sram_z",
+    )
 
-    # 1. 构建 CF_z (Correction Factor)
-    CF_z = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name="CF_src3_z")
-    # 修正 src-3 z轴: 理论推导表明 CF_z = (B3 * k2) / L0，无论是否行走轴
-    # (原代码在行走轴分支漏乘了 k2，导致修正项偏小，能量偏大)
-    m.addQConstr(CF_z == B3['z'] * k[(2, 'z')] * (1.0 / float(L0['z'])), name="def_CF_z")
+    E_src3 = gp.LinExpr(0.0)
+    for d in ("x", "y"):
+        source_sram = source3_sram[d]
+        source_ddr = source3[d] - source_sram
+        E_src3 += E_RF_w * receiver3[d]
+        E_src3 += E_SRAM_r * source_sram + E_DDR_r * source_ddr
 
-    # 2. 构建 B1 * CF_z (用于区分 SRAM/DDR 的扣除项)
-    B1_CF_z = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name="B1_CF_z")
-    m.addQConstr(B1_CF_z == B1['z'] * CF_z, name="QC_B1_CF_z")
+    source3_sram_z = source3_sram["z"]
+    source3_ddr_z = source3["z"] - source3_sram_z
+    old_source3_ddr_z = old_source3_z - old_source3_sram_z
+    E_src3 += E_RF_w * old_receiver3_z
+    E_src3 += E_SRAM_w * source3_sram_z + E_SRAM_r * old_source3_sram_z
+    E_src3 += E_DDR_w * source3_ddr_z + E_DDR_r * old_source3_ddr_z
 
-    c3z = counts3_map['z']
-    tau3z = tau3counts_B1['z']
+    # -----------------------------------------------------------------
+    # src--4: mutually exclusive nearest source and spatial aggregation.
+    # -----------------------------------------------------------------
+    source4_sram: Dict[str, gp.Var] = {}
+    source4_ddr: Dict[str, gp.Var] = {}
+    src4_sram_selected: Dict[str, gp.Var] = {}
+    src4_ddr_selected: Dict[str, gp.Var] = {}
+    for d in Dims:
+        src4_sram_selected[d] = _and_bin_neg(
+            model,
+            B1[d],
+            B3[d],
+            f"src4_select_sram_{d}",
+        )
+        src4_ddr_selected[d] = _nor_bins(
+            model,
+            B1[d],
+            B3[d],
+            f"src4_select_ddr_{d}",
+        )
+        model.addConstr(
+            B3[d] + src4_sram_selected[d] + src4_ddr_selected[d] == 1,
+            name=f"src4_source_partition_{d}",
+        )
+        source4_sram[d] = _gate_product(
+            model,
+            src4_sram_selected[d],
+            invk2[d],
+            1.0,
+            f"Nnorm_source_src4_sram_{d}",
+        )
+        source4_ddr[d] = _gate_product(
+            model,
+            src4_ddr_selected[d],
+            invk2[d],
+            1.0,
+            f"Nnorm_source_src4_ddr_{d}",
+        )
 
-    # 3. 计算能量
-    # (A) RegFile Write (Upstream): counts3 * rho * E_RF_w => (c3z - CF_z) * E_RF_w
-    obj += E_RF_w * (c3z - CF_z)
+    E_src4 = gp.LinExpr(0.0)
+    for d in ("x", "y"):
+        E_src4 += E_RF_r * B3[d]
+        E_src4 += E_SRAM_r * source4_sram[d]
+        E_src4 += E_DDR_r * source4_ddr[d]
 
-    # (B) DDR Source (B1=0): E_w/k2 + rho*E_r/k2
-    # 贡献量: (1-B1)*[ c3z * E_DDR_w + (c3z - CF_z) * E_DDR_r ] * invk2
-    # 展开 (1-B1)*c3z = c3z - tau3z;  (1-B1)*CF_z = CF_z - B1_CF_z
-    term_ddr_w = (c3z - tau3z) * E_DDR_w
-    term_ddr_r = (c3z - tau3z - (CF_z - B1_CF_z)) * E_DDR_r
-    obj += (term_ddr_w + term_ddr_r) * invk2['z']
+    old_source4_rf_z = model.addVar(
+        vtype=GRB.CONTINUOUS,
+        lb=0.0,
+        ub=1.0,
+        name="Nnorm_oldread_source_src4_rf_z",
+    )
+    old_source4_sram_z = model.addVar(
+        vtype=GRB.CONTINUOUS,
+        lb=0.0,
+        ub=1.0,
+        name="Nnorm_oldread_source_src4_sram_z",
+    )
+    old_source4_ddr_z = model.addVar(
+        vtype=GRB.CONTINUOUS,
+        lb=0.0,
+        ub=1.0,
+        name="Nnorm_oldread_source_src4_ddr_z",
+    )
+    model.addConstr(
+        _NORMALIZED_FLOW_SCALE * old_source4_rf_z
+        == _NORMALIZED_FLOW_SCALE
+        * (B3["z"] - B3_k2_z / float(L0["z"])),
+        name="define_Nnorm_oldread_source_src4_rf_z",
+    )
+    model.addConstr(
+        _NORMALIZED_FLOW_SCALE * old_source4_sram_z
+        == _NORMALIZED_FLOW_SCALE
+        * (
+            source4_sram["z"]
+            - src4_sram_selected["z"] / float(L0["z"])
+        ),
+        name="define_Nnorm_oldread_source_src4_sram_z",
+    )
+    model.addConstr(
+        _NORMALIZED_FLOW_SCALE * old_source4_ddr_z
+        == _NORMALIZED_FLOW_SCALE
+        * (
+            source4_ddr["z"]
+            - src4_ddr_selected["z"] / float(L0["z"])
+        ),
+        name="define_Nnorm_oldread_source_src4_ddr_z",
+    )
 
-    # (C) SRAM Source (B1=1): E_w/k2 + rho*E_r/k2
-    # 贡献量: B1*[ c3z * E_SRAM_w + (c3z - CF_z) * E_SRAM_r ] * invk2
-    term_sram_w = tau3z * E_SRAM_w
-    term_sram_r = (tau3z - B1_CF_z) * E_SRAM_r
-    obj += (term_sram_w + term_sram_r) * invk2['z']
+    E_src4 += E_RF_w * B3["z"] + E_RF_r * old_source4_rf_z
+    E_src4 += E_SRAM_w * source4_sram["z"] + E_SRAM_r * old_source4_sram_z
+    E_src4 += E_DDR_w * source4_ddr["z"] + E_DDR_r * old_source4_ddr_z
 
-    # =========================================================
-    # (3) Src-4: 上级→MACC (§2.3, §4.2-3)
-    # =========================================================
-    # 辅助变量: 互斥选择 z14 (SRAM->MACC), z04 (DDR->MACC)
-    z14 = {i: _and_bin_neg(m, B1[i], B3[i], f"z14_{i}") for i in Dims}  # B1 & ~B3
-    z04 = {i: _and_bin_neg(m, 1 - B1[i], B3[i], f"z04_{i}") for i in Dims}  # ~B1 & ~B3
-
-    # --- X/Y 轴 (标准) ---
-    for i in ('x', 'y'):
-        obj += B3[i] * E_RF_r  # RegFile->MACC
-        obj += z14[i] * (E_SRAM_r * invk2[i])  # SRAM->MACC
-        obj += z04[i] * (E_DDR_r * invk2[i])  # DDR->MACC
-
-    # --- Z 轴 (含 rho 修正) ---
-    # 1. RegFile Source: E = B3 * (E_w + rho*E_r)
-    # rho_4 = 1 - k2/L0. => E = B3*(E_w+E_r) - B3*k2 * (E_r/L0)
-    obj += B3['z'] * (E_RF_w + E_RF_r)
-    obj += -(E_RF_r / float(L0['z'])) * (B3['z'] * k[(2, 'z')])  # Quadratic: Bin*Int
-
-    # 2. SRAM Source: E = z14 * (E_w + rho*E_r) / k2
-    # = z14 * [ (E_w+E_r)/k2 - (E_r/L0) ]  (因 rho/k2 = 1/k2 - 1/L0)
-    term_s4_sram = z14['z'] * (E_SRAM_w + E_SRAM_r) * invk2['z']
-    term_s4_sram -= z14['z'] * (E_SRAM_r / float(L0['z']))
-    obj += term_s4_sram
-
-    # 3. DDR Source: 同理
-    term_s4_ddr = z04['z'] * (E_DDR_w + E_DDR_r) * invk2['z']
-    term_s4_ddr -= z04['z'] * (E_DDR_r / float(L0['z']))
-    obj += term_s4_ddr
-
-    # =========================================================
-    # (4) MACC: 每体素 E_MACC (§2.4, §4.2-4)
-    # =========================================================
-    obj += E_MACC
-
-    m.setObjective(obj, GRB.MINIMIZE)
-    return m, L, k, y, B1, B3, a01, a12
+    objective = E_src1 + E_src3 + E_src4 + E_MACC
+    model.setObjective(objective, GRB.MINIMIZE)
+    return model, L, k, y, B1, B3, a01, a12

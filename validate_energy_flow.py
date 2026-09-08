@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Validate bundled dataflows using the reviewed energy model and Timeloop.
+
+Inputs are copied under --outdir. Existing nonempty output directories are
+rejected; --start/--limit select a subset into a new output directory.
 """
-能量模型一致性验证脚本（新增，保持现有文件不变）
-------------------------------------------------
-
-功能：
-  1) 基于 tilings_random.json 生成 8064 组数据流（调用现有 dataflow_gen 逻辑）。
-  2) 为每一组数据流从模板生成 Timeloop 的 problem.yaml 与 mapping.yaml。
-  3) 参考 run_model.py 的方式调用 Timeloop 仿真，解析输出拿到归一化能量（pJ/compute）。
-  4) 调用自研 normalized_energy_model 计算归一化能量（pJ/compute）。
-  5) 对比两者，输出汇总 CSV/JSON 日志。
-
-注意：
-  - 禁止修改现有文件；本脚本仅新增，并尽量复用/拷贝已有模块的函数实现。
-  - 运行时按顺序复用 inputs_my/problem.yaml 与 inputs_my/mapping.yaml（逐例覆盖），
-    但每个用例的 Timeloop 输出会写到独立的输出目录，避免相互覆盖。
-
-用法示例：
-  python validate_energy_flow.py \
-    --tilings tilings_random.json \
-    --outdir outputs_validation \
-    --limit 100   # 可选，调试时先跑前 100 例
-
-依赖：需在虚拟环境中安装 pytimeloop，本仓库已有 .venv 可用。
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -44,6 +23,8 @@ import pytimeloop.timeloopfe.v4 as tl
 
 # 解析 YAML
 import yaml
+from timeloop_utils import prepare_environment
+from mapping_pipeline import _generate_ert_with_accelergy, _run_timeloop_model
 
 # 解析 Timeloopfe v4 架构节点（与 mapping_pipeline.py 同口径）
 from pytimeloop.timeloopfe.v4.arch import Storage, Container
@@ -319,18 +300,17 @@ def _run_timeloop_once(
     top = here / "top_model.jinja"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    spec = tl.Specification.from_yaml_files(
-        str(top),
-        jinja_parse_data={
-            "inputs_dir": str(inputs_dir),
-            "arch": str(arch_yaml.resolve()),
-            "problem": str(problem_yaml.resolve()),
-        },
-    )
+    jinja = {
+        "inputs_dir": str(inputs_dir.resolve()),
+        "arch": str(arch_yaml.resolve()),
+        "problem": str(problem_yaml.resolve()),
+    }
     try:
-        tl.call_model(spec, output_dir=str(out_dir))
+        ert = out_dir.parent / "timeloop-model.ERT.yaml"
+        if not ert.exists():
+            _generate_ert_with_accelergy(top, out_dir.parent / "accelergy_tmp", ert, jinja)
+        _run_timeloop_model(top, ert, out_dir, jinja)
     except Exception as e:
-        # 返回错误信息，调用方决定是否跳过
         return None, None, str(e)
 
     stats_path = out_dir / "timeloop-model.stats.txt"
@@ -386,7 +366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="仅运行前 N 例（调试用）")
     parser.add_argument("--start", type=int, default=0, help="从第 start 个用例开始（用于断点续跑）")
     parser.add_argument("--progress-every", type=int, default=1, help="进度输出频率（每 N 例打印一次，默认: 1）")
-    parser.add_argument("--rtol", type=float, default=1e-6, help="(已弃用) 相对误差容忍度；当前仅基于绝对误差判断")
+    parser.add_argument("--rtol", type=float, default=1e-6, help="相对误差容忍度（默认: 1e-6）")
     parser.add_argument("--atol", type=float, default=1e-5, help="绝对误差容忍度 pJ/compute (默认: 1e-5)")
     parser.add_argument("--first-two-tilings-only", action="store_true", default=False, help="仅使用每个问题的前两种分块方式")
     return parser.parse_args()
@@ -396,7 +376,19 @@ def main() -> int:
     t0 = time.perf_counter()
     here = Path(__file__).resolve().parent
     args = parse_args()
-    inputs_dir = args.inputs_dir.expanduser().resolve()
+    prepare_environment()
+    if args.start < 0 or (args.limit is not None and args.limit <= 0):
+        raise ValueError("--start must be nonnegative; --limit must be positive")
+    if not math.isfinite(args.atol) or not math.isfinite(args.rtol) or min(args.atol, args.rtol) < 0:
+        raise ValueError("Tolerances must be finite and nonnegative")
+    outdir = args.outdir.expanduser().resolve()
+    if outdir.is_relative_to(args.inputs_dir.expanduser().resolve()):
+        raise ValueError("Validation output must be outside the source input directory")
+    if outdir.exists() and any(outdir.iterdir()):
+        raise FileExistsError(f"Use a new validation output directory: {outdir}")
+    outdir.mkdir(parents=True, exist_ok=True)
+    inputs_dir = outdir / "inputs"
+    shutil.copytree(args.inputs_dir.expanduser().resolve(), inputs_dir)
     arch_yaml = args.arch_yaml.expanduser().resolve()
     if not arch_yaml.exists():
         raise FileNotFoundError(f"--arch-yaml 指向的文件不存在：{arch_yaml}")
@@ -404,8 +396,6 @@ def main() -> int:
     problem_yaml = inputs_dir / "problem.yaml"
     mapping_yaml = inputs_dir / "mapping.yaml"
     top_model = here / "top_model.jinja"
-    outdir = args.outdir
-    outdir.mkdir(parents=True, exist_ok=True)
 
     # 解析硬件参数（mesh/C1/C3/N_PE）与存储位宽，用于：
     #   - 生成 2D spatial mapping（PEy+PE）
@@ -430,13 +420,21 @@ def main() -> int:
     if int(tiling_db.pe_num) != int(N_PE):
         raise RuntimeError(
             f"tilings_random.json 的 pe_num={tiling_db.pe_num} 与架构解析得到的 N_PE={N_PE} 不一致；"
-            "请先用与当前架构匹配的 gen_random_tilings.py 重新生成 tilings。"
+            "请提供与当前架构 PE 数匹配的 tiling 数据库。"
         )
     items = _load_workloads(args.tilings, first_two_only=args.first_two_tilings_only, db=tiling_db)
     total = len(items)
     start = max(0, args.start)
-    end = min(total, start + args.limit) if args.limit else total
+    end = min(total, start + args.limit) if args.limit is not None else total
     items = items[start:end]
+    if not items:
+        raise ValueError("No validation cases selected")
+    (outdir / "metadata.json").write_text(json.dumps({
+        "model": "review1_bugfix", "arch": str(arch_yaml),
+        "tilings": str(args.tilings.resolve()), "start": start, "count": len(items),
+        "atol": args.atol, "rtol": args.rtol, "units": "pJ/MAC including leakage",
+        "criterion": "abs_err <= atol + rtol * max(abs(E_python), abs(E_timeloop))",
+    }, indent=2) + "\n")
     progress_every = max(1, int(getattr(args, "progress_every", 1)))
 
     # 延迟一次性读取 ERT：首个用例跑完 Timeloop 后，从该用例输出目录读取
@@ -466,7 +464,9 @@ def main() -> int:
         # 0) 若 hatL_01[alpha01]==1 或 hatL_12[alpha12]==1，调整行走轴
         if int(work.hatL_01[work.alpha01]) == 1:
             work.alpha01 = _choose_new_axis(work.alpha01, work.hatL_01)
-        if int(work.hatL_12[work.alpha12]) == 1:
+        if all(v == 1 for v in work.hatL_12.values()):
+            work.alpha12 = work.alpha01
+        elif int(work.hatL_12[work.alpha12]) == 1:
             work.alpha12 = _choose_new_axis(work.alpha12, work.hatL_12)
         if case_out.exists():
             shutil.rmtree(case_out)
@@ -519,24 +519,19 @@ def main() -> int:
         # 3) 自研能量：在首个用例完成 Timeloop 后读取 ERT（一次），后续复用
         if params_global is None:
             params_global = _device_params_from_ert_path(
-                case_out / "timeloop-model.ERT.yaml",
+                outdir / "timeloop-model.ERT.yaml",
                 storage_width_datawidth=storage_width_datawidth,
             )
         # 使用全局参数；无需每例读取 ERT
         py_pj, parts = _run_python_energy(work, params_global)
-        py_pj = round(py_pj, 5)
 
         # 4) 对比
         abs_err = abs(tl_pj - py_pj)
         denom = max(abs(tl_pj), abs(py_pj), 1e-12)
         rel_err = abs_err / denom
-        # 误差判定规则：仅基于绝对误差；当 abs_err <= 1e-5（默认）视为无误差，写入文件统一记为 0
-        # 注意：浮点数在边界处可能出现 1e-5 -> 1.0000000003e-5 的数值抖动；
-        # 为避免“打印看起来等于 1e-5 但被判定为 mismatch”，这里加入一个极小的容差修正。
-        eps = max(1e-12, float(args.atol) * 1e-9)
-        match = (abs_err <= float(args.atol) + eps)
-        abs_err_out = 0.0 if match else abs_err
-        rel_err_out = 0.0 if match else rel_err
+        match = abs_err <= args.atol + args.rtol * max(abs(tl_pj), abs(py_pj))
+        abs_err_out = abs_err
+        rel_err_out = rel_err
         ok_cnt += 1 if match else 0
 
         # 若不一致，则保留该轮 timeloop 输出到独立目录（覆盖旧同名目录）
@@ -572,7 +567,7 @@ def main() -> int:
             w = csv.writer(f_csv)
             w.writerow([
                 wid, work.problem_id, work.alpha01, work.alpha12, "-",
-                f"{tl_pj:.6f}", f"{py_pj:.6f}", f"{abs_err_out:.6f}", f"{rel_err_out:.3e}",
+                repr(tl_pj), repr(py_pj), repr(abs_err_out), repr(rel_err_out),
                 int(match),
             ])
 
@@ -594,7 +589,7 @@ def main() -> int:
             print(f"Total runtime: {hours:d}h {minutes:d}m {seconds:.1f}s")
         else:
             print(f"Total runtime: {minutes:d}m {seconds:.1f}s")
-    return 0
+    return 0 if ok_cnt == len(items) else 1
 
 
 if __name__ == "__main__":

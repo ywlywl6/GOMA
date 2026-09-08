@@ -1,0 +1,10 @@
+# 04_attn_context.yaml
+# 说明: Score * V 计算最终上下文
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    # GQA 映射: X = SeqLen(8192) * (Hq/Hkv)(4) = 32768
+    X: 32768
+    Y: 64      # Head Dim (输出维度)
+    Z: 8192    # SeqLen (归约维度)

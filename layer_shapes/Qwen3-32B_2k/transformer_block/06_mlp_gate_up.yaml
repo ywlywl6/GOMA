@@ -1,0 +1,9 @@
+# 06_mlp_gate_up.yaml
+# 说明: SwiGLU 升维
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 2048    # Sequence Length (Updated)
+    Z: 5120    # Input (Hidden Size)
+    Y: 25600   # Intermediate Size

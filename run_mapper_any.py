@@ -7,6 +7,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from timeloop_utils import prepare_environment
 
 DEFAULT_OUTPUT_DIR = Path("outputs_mapper")
 
@@ -17,7 +18,7 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "示例：\n"
             "  python run_mapper_any.py --arch architecture/a100_like.yaml "
-            "--problem layer_shapes/Qwen3-32B_2k/transformer_block/01_attn_q_proj.yaml\n"
+            "--problem inputs_my/problem.yaml\n"
             "  python run_mapper_any.py --arch /abs/path/arch.yaml --problem /abs/path/problem.yaml --out /tmp/out\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -43,6 +44,7 @@ def _resolve_out_dir(out: Path, *, here: Path) -> Path:
 def main() -> None:
     here = Path(__file__).resolve().parent
     args = parse_args()
+    prepare_environment()
     import pytimeloop.timeloopfe.v4 as tl
 
     top = here / "top_mapper.jinja"
@@ -63,6 +65,7 @@ def main() -> None:
     spec = tl.Specification.from_yaml_files(
         str(top),
         jinja_parse_data={
+            "inputs_dir": str(here / "inputs_my"),
             "arch": str(arch_path),
             "problem": str(problem_path),
         },

@@ -14,11 +14,11 @@ def main():
 
     if not os.path.exists(ert_yaml):
         print("ERT file not found at:", ert_yaml)
-        print("Please run run_model.py first to generate it.")
+        print("Please run mapping_pipeline.py --generate-ert-only first.")
         return
 
     # Build v4 Specification; ERT.yaml contributes the top-level ERT key
-    spec = tl.Specification.from_yaml_files(top, ert_yaml)
+    spec = tl.Specification.from_yaml_files(top, ert_yaml, jinja_parse_data={"inputs_dir": os.path.join(here, "inputs_my")})
 
     # If there are expressions depending on variables, this resolves them
     spec.parse_expressions()

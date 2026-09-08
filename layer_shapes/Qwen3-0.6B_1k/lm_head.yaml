@@ -1,0 +1,10 @@
+# 08_lm_head.yaml
+# 说明: 词表映射
+# Qwen3-0.6B Vocab Size 通常为 151936 (或 151643)，此处取标准值
+{{include_text('../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 1       # Last Token Slice
+    Z: 1024    # Hidden Size
+    Y: 151936  # Vocab Size (Qwen 特有大词表)

@@ -1,0 +1,10 @@
+# 02_attn_kv_proj.yaml
+# KV Projection: Input(8192) -> Output(1024)
+# 注意: Output = 8 KV_Heads * 128 Head_Dim = 1024
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 2048
+    Z: 8192    # Input (Hidden Size)
+    Y: 1024    # Output (KV Dim)

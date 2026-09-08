@@ -7,6 +7,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from timeloop_utils import prepare_environment
 
 DEFAULT_OUTPUT_DIR = Path("outputs_my")
 DEFAULT_INPUTS_DIR = Path("inputs_my")
@@ -18,11 +19,12 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "示例：\n"
             "  python run_model_any.py --arch architecture/a100_like.yaml "
-            "--problem layer_shapes/Qwen3-32B_2k/transformer_block/01_attn_q_proj.yaml\n"
+            "--problem inputs_my/problem.yaml\n"
             "  python run_model_any.py --arch /abs/path/arch.yaml --problem /abs/path/problem.yaml --out /tmp/out\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--mapping", type=Path, help="Mapping YAML (default: <inputs-dir>/mapping.yaml)")
     p.add_argument("--arch", type=Path, required=True, help="architecture YAML 文件路径（可为相对路径）")
     p.add_argument("--problem", type=Path, required=True, help="problem YAML 文件路径（可为相对路径）")
     p.add_argument(
@@ -50,6 +52,7 @@ def _resolve_under_here(p: Path, *, here: Path) -> Path:
 def main() -> None:
     here = Path(__file__).resolve().parent
     args = parse_args()
+    prepare_environment()
     import pytimeloop.timeloopfe.v4 as tl
 
     top = here / "top_model.jinja"
@@ -70,13 +73,14 @@ def main() -> None:
     inputs_dir = _resolve_under_here(args.inputs_dir, here=here)
     if not inputs_dir.is_dir():
         raise FileNotFoundError(f"未找到默认 inputs 目录：{inputs_dir}")
-    mapping_yaml = inputs_dir / "mapping.yaml"
+    mapping_yaml = args.mapping.expanduser().resolve() if args.mapping else inputs_dir / "mapping.yaml"
     if not mapping_yaml.is_file():
         raise FileNotFoundError(f"未找到默认 mapping.yaml：{mapping_yaml}")
 
     spec = tl.Specification.from_yaml_files(
         str(top),
         jinja_parse_data={
+            "mapping": str(mapping_yaml),
             "arch": str(arch_path),
             "problem": str(problem_path),
             # 固定 mapping/variables/mapper 等 inputs 均来自该目录

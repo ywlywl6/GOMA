@@ -1,0 +1,9 @@
+# 05_attn_output.yaml
+# 说明: 将多头结果融合回残差流
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 1024
+    Z: 2048    # Input (Hidden Size)
+    Y: 2048    # Output (Hidden Size)

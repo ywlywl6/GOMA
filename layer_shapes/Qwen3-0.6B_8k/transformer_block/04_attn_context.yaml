@@ -1,0 +1,9 @@
+# 04_attn_context.yaml (Score * V)
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    # GQA 映射: 8192 * 2 = 16384
+    X: 16384
+    Y: 128     # Head Dim
+    Z: 8192    # Key Length

@@ -1,36 +1,21 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Single-layer workflow: Accelergy -> reviewed GOMA -> Timeloop-model.
+
+Run ``python mapping_pipeline.py --help``. Generated mapping and timing files
+are written under --outputs-dir; source inputs are read-only.
 """
-最终映射求解流程（一键脚本）
---------------------------------
-
-阶段：
-  1) 通过 Accelergy 从体系结构生成 ERT（Energy Reference Table）（可复用已有 ERT）。
-  2) 从 problem.yaml / arch.yaml / ERT 解析 L0、C1、C3、N_PE 与能量参数，构造 make_cfg 等价配置。
-  3) 调用 full_model.build_model_full 求解最优数据流（L / k / B / alpha）。
-  4) 将求得的数据流转换为 Timeloop 映射格式，只生成 / 覆盖 inputs_my/mapping.yaml（不改动 problem.yaml）。
-  5) 复用同一 ERT 调用 timeloop-model，输出访存次数、能耗等性能指标。
-
-使用方式（建议在工程根执行，并已激活 venv）::
-
-    cd <项目根目录>
-    # 可选：激活你自己的 Python 环境（示例）
-    # source .venv/bin/activate
-    python timeloop-accelergy-exercises/workspace/my_designs/GOMA/mapping_pipeline.py
-
-如需强制重新跑 Accelergy 生成 ERT，可加上::
-
-    python .../mapping_pipeline.py --force-regenerate-ert
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+from datetime import datetime, timezone
 import os
+import shutil
+import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import yaml
 
@@ -39,13 +24,13 @@ from pytimeloop.timeloopfe.v4.arch import Storage, Container
 from pytimeloop.timeloopfe.common import backend_calls
 from pytimeloop.timeloopfe.v4.output_parsing import parse_stats_file
 
-from full_model import build_model_full
-from normalized_energy_model import DeviceParams, compute_normalized_total_energy
-from gen_problem_mapping import (
-    copy_template,
-    update_problem_file,
-    update_mapping_file,
-)
+import full_model as optimizer_module
+import normalized_energy_model as energy_module
+from gen_problem_mapping import copy_template, update_problem_file, update_mapping_file
+from solver import _solve_full_model, _extract_mapping_params
+from timeloop_utils import prepare_environment
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 AXES = ("x", "y", "z")
@@ -81,7 +66,7 @@ def _generate_ert_with_accelergy(
     - 通过 timeloopfe v4 构造 Specification（负责解析 Jinja 与 include）。
     - 使用 backend_calls.accelergy_app(spec, tmp_out_dir) 调用 Accelergy
       （内部会通过 pytimeloop.accelergy_interface.invoke_accelergy 调用 CLI）。
-    - 将返回的 ert_str 写入 ert_out_path，供后续阶段统一使用。
+    - 将返回的 ERT/ART 写入公共路径，供后续阶段统一使用。
     """
     tmp_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -90,6 +75,10 @@ def _generate_ert_with_accelergy(
 
     ert_out_path.parent.mkdir(parents=True, exist_ok=True)
     ert_out_path.write_text(result.ert, encoding="utf-8")
+    ert_out_path.with_name("timeloop-model.ART.yaml").write_text(
+        result.art,
+        encoding="utf-8",
+    )
     return ert_out_path
 
 
@@ -172,7 +161,8 @@ def _load_problem_arch_from_spec(
 def _device_params_from_ert_path(
     ert_path: Path,
     storage_width_datawidth: Dict[str, Tuple[int, int]],
-) -> DeviceParams:
+    device_params_cls: type,
+) -> Any:
     """
     阶段 2：从 ERT 解析能量参数。
 
@@ -220,7 +210,7 @@ def _device_params_from_ert_path(
     E_RF_read = get_action_energy(rf, "read") / word_scale("regfile")
     E_RF_write = get_action_energy(rf, "write") / word_scale("regfile")
 
-    return DeviceParams(
+    return device_params_cls(
         E_DDR_read=E_DDR_read,
         E_DDR_write=E_DDR_write,
         E_SRAM_read=E_SRAM_read,
@@ -238,7 +228,7 @@ def _build_cfg(
     C1: int,
     C3: int,
     N_PE: int,
-    params: DeviceParams,
+    params: Any,
 ) -> Dict[str, object]:
     """
     构造与 main.make_cfg 等价的配置字典，用于 full_model.build_model_full。
@@ -261,100 +251,9 @@ def _build_cfg(
     return cfg
 
 
-def _solve_full_model(cfg: Dict[str, object], verbose: bool = True):
-    """
-    阶段 3：基于 cfg 与能量模型，求解最优数据流（L/k/B/alpha）。
-
-    返回：
-      - model, L, k, y, B1, B3, a01, a12  （与 full_model.build_model_full 一致）
-    并在 verbose 时打印一份简要解读信息。
-    """
-    import gurobipy as gp  # 本地导入，避免在未安装 gurobi 时影响模块导入
-
-    grb_params = {"OutputFlag": 1, "NonConvex": 2}
-    model, L, k, y, B1, B3, a01, a12 = build_model_full(cfg, params=grb_params)
-    model.optimize()
-
-    if model.Status not in (gp.GRB.OPTIMAL, gp.GRB.SUBOPTIMAL, gp.GRB.TIME_LIMIT):
-        raise RuntimeError(f"Gurobi 求解失败，状态码={model.Status}")
-
-    if verbose:
-        # 泄露能量（仅报告用，不进目标）
-        num_pe = int(k[(2, "x")].X) * int(k[(2, "y")].X) * int(k[(2, "z")].X)
-        E_leak_per_cycle = cfg["E_SRAM_leak"] + cfg["E_RF_leak"] * num_pe
-        E_leak_norm = E_leak_per_cycle / num_pe if num_pe > 0 else 0.0
-        total_energy = float(model.ObjVal) + float(E_leak_norm)
-        print(
-            f"[MILP] status={model.Status}, Total Normalized Energy={total_energy:.6f} "
-            f"(Dynamic={model.ObjVal:.6f} + Leak={E_leak_norm:.6f})"
-        )
-
-        # 找出行走轴
-        alpha01 = max(a01, key=lambda d: a01[d].X)
-        alpha12 = max(a12, key=lambda d: a12[d].X)
-        print(f"[MILP] alpha_0-1 = {alpha01}, alpha_1-2 = {alpha12}")
-
-        # B1/B3 驻留开关
-        print("[MILP] B1:", {d: int(B1[d].X) for d in AXES})
-        print("[MILP] B3:", {d: int(B3[d].X) for d in AXES})
-
-        # 三级块长 / 整除比
-        for i in AXES:
-            print(
-                f"[MILP] {i}: "
-                f"L1={int(L[(1, i)].X)}, L2={int(L[(2, i)].X)}, L3={int(L[(3, i)].X)} | "
-                f"k0={int(k[(0, i)].X)}, k1={int(k[(1, i)].X)}, "
-                f"k2={int(k[(2, i)].X)}, k3={int(k[(3, i)].X)}"
-            )
-
-    return model, L, k, y, B1, B3, a01, a12
-
-
-def _extract_mapping_params(
-    cfg: Dict[str, object],
-    L,
-    k,
-    B1,
-    B3,
-    a01,
-    a12,
-) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], Dict[str, int], str, str, Dict[str, int], Dict[str, int]]:
-    """
-    阶段 3→4 之间的桥接：把 MILP 解翻译为自研数据流参数：
-
-      - hatL_01 / hatL_12 / hatL_23 / hatL_34  （整除关系：L0 = k0*k1*k2*k3）
-      - alpha01 / alpha12                       （行走轴）
-      - B1 / B3                                 （逐轴驻留开关）
-    """
-    # k[(p, dim)] 即各阶段的整除因子，直接对应 hatL_{0-1}, hatL_{1-2}, hatL_{2-3}, hatL_{3-4}
-    hatL_01 = {d: int(k[(0, d)].X) for d in AXES}
-    hatL_12 = {d: int(k[(1, d)].X) for d in AXES}
-    hatL_23 = {d: int(k[(2, d)].X) for d in AXES}
-    hatL_34 = {d: int(k[(3, d)].X) for d in AXES}
-
-    # 行走轴 one-hot
-    alpha01 = max(a01, key=lambda d: a01[d].X)
-    alpha12 = max(a12, key=lambda d: a12[d].X)
-
-    B1_map = {d: int(B1[d].X) for d in AXES}
-    B3_map = {d: int(B3[d].X) for d in AXES}
-
-    # 简单一致性检查：L0 == k0*k1*k2*k3
-    for d in AXES:
-        L0_d = int(cfg["L0"][d])
-        prod = hatL_01[d] * hatL_12[d] * hatL_23[d] * hatL_34[d]
-        if L0_d != prod:
-            raise RuntimeError(
-                f"轴 {d} 上 L0={L0_d} 与 k0*k1*k2*k3={prod} 不一致（模型约束应保证相等，"
-                "若触发此错误说明求解结果可能无效）。"
-            )
-
-    return hatL_01, hatL_12, hatL_23, hatL_34, alpha01, alpha12, B1_map, B3_map
-
-
 def _update_problem_and_mapping(
     here: Path,
-    inputs_dir: Path,
+    output_dir: Path,
     L0: Dict[str, int],
     hatL_01: Dict[str, int],
     hatL_12: Dict[str, int],
@@ -370,14 +269,14 @@ def _update_problem_and_mapping(
     """
     阶段 4：基于求得的数据流参数，生成/覆盖 Timeloop 的 mapping.yaml。
 
-    - problem.yaml：保留用户已有 problem.yaml，不做改动；
+    - problem.yaml 不由此函数生成；返回路径只用于兼容旧接口。
     - mapping.yaml：从模板复制并调用 update_mapping_file 写入 factors/permutation/keep。
     """
     templates_dir = here / "templates"
     mapping_tmpl = templates_dir / "mapping_template.yaml"
 
-    problem_path = inputs_dir / "problem.yaml"
-    mapping_path = inputs_dir / "mapping.yaml"
+    problem_path = output_dir / "problem.yaml"
+    mapping_path = output_dir / "mapping.yaml"
 
     copy_template(mapping_tmpl, mapping_path)
 
@@ -403,7 +302,7 @@ def _run_timeloop_model(
     ert_path: Path,
     out_dir: Path,
     jinja_parse_data: Optional[Dict[str, str]] = None,
-) -> None:
+) -> float:
     """
     阶段 5：调用 timeloop-model，使用同一 ERT 评估最终映射。
 
@@ -418,22 +317,64 @@ def _run_timeloop_model(
         str(ert_path),
         jinja_parse_data=jinja_parse_data or {},
     )
-    tl.call_model(spec, output_dir=str(out_dir))
-
     stats_path = out_dir / "timeloop-model.stats.txt"
+    stats_before = (
+        (stats_path.stat().st_mtime_ns, stats_path.stat().st_size)
+        if stats_path.exists()
+        else None
+    )
+
+    prepare_environment()
+    # Reuse both architecture-level tables.  Older case outputs only kept the
+    # normalized ERT next to ``accelergy_tmp/ART.yaml``; accept that layout so
+    # they do not need to regenerate Accelergy data.  The ART is also copied to
+    # the filename expected by timeloopfe's output parser.
+    art_candidates = [
+        ert_path.with_name("timeloop-model.ART.yaml"),
+        ert_path.parent / "accelergy_tmp" / "ART.yaml",
+        out_dir / "timeloop-model.ART.yaml",
+    ]
+    art_path = next((path for path in art_candidates if path.is_file()), None)
+    extra_input_files = None
+    if art_path is not None:
+        output_art_path = out_dir / "timeloop-model.ART.yaml"
+        if art_path.resolve() != output_art_path.resolve():
+            shutil.copy2(art_path, output_art_path)
+        extra_input_files = [str(ert_path.resolve()), str(art_path.resolve())]
+    else:
+        print(
+            "[Timeloop] 外部 ERT 缺少配套 ART；回退为 Timeloop/Accelergy "
+            "生成本层能量与面积表。"
+        )
+
+    tl.call_model(
+        spec,
+        output_dir=str(out_dir),
+        # Loading these tables into the front-end Specification is needed by
+        # Stage 2, but the v4 -> v3 model input does not serialize them.  Pass
+        # them to Timeloop separately; otherwise it sees only the compound
+        # components and invokes Accelergy again for every layer.
+        extra_input_files=extra_input_files,
+    )
+
     if not stats_path.exists():
-        print(f"[Timeloop] 未找到 stats 文件：{stats_path}")
-        return
+        raise RuntimeError(f"Timeloop 未生成 stats 文件：{stats_path}")
+    stats_after = (stats_path.stat().st_mtime_ns, stats_path.stat().st_size)
+    if stats_before is not None and stats_after == stats_before:
+        raise RuntimeError(
+            "Timeloop 调用后 stats 文件未更新，拒绝复用旧结果："
+            f"{stats_path}"
+        )
 
     cycles, computes, util, energy_J, accesses = parse_stats_file(str(stats_path))
     total_energy_J = sum(float(v) for v in energy_J.values())
     if computes <= 0:
-        print("[Timeloop] stats 中 computes <= 0，无法计算归一化能量。")
-        return
+        raise RuntimeError("Timeloop stats contains no computes")
 
     pJ_per_compute = total_energy_J / computes * 1e12
     print(f"[Timeloop] pJ/compute = {pJ_per_compute:.6f}")
     print(f"[Timeloop] cycles = {cycles}, computes = {computes}, util = {util:.4f}")
+    return pJ_per_compute
 
 
 def _check_python_energy(
@@ -445,8 +386,10 @@ def _check_python_energy(
     alpha12: str,
     B1: Dict[str, int],
     B3: Dict[str, int],
-    params: DeviceParams,
-) -> None:
+    params: Any,
+    compute_normalized_total_energy: Callable,
+    objective: float,
+) -> float:
     """
     可选：使用自研 normalized_energy_model 计算一次归一化能量，作为额外 sanity check。
     """
@@ -468,15 +411,19 @@ def _check_python_energy(
         params=params,
         include_leak=True,
     )
-    print(f"[PythonEnergy] phi (含 leak) = {phi:.6f}, parts = {parts}")
+    dynamic = phi - parts["Eleak"]
+    if abs(dynamic - objective) > 1e-5 + 1e-6 * max(abs(dynamic), abs(objective)):
+        raise RuntimeError(f"Optimizer/formula mismatch: {objective} vs {dynamic}")
+    print(f"[PythonEnergy] phi (含 leak) = {phi:.12g}, parts = {parts}")
+    return phi
 
 
 def parse_args() -> argparse.Namespace:
-    here = Path(__file__).resolve().parent
+    here = PROJECT_ROOT
     default_inputs = here / "inputs_my"
     default_outputs = here / "outputs_my"
 
-    parser = argparse.ArgumentParser(description="最终映射求解流水线：Accelergy→MILP→Timeloop")
+    parser = argparse.ArgumentParser(description="最终映射求解流水线：Accelergy→MIQCP→Timeloop")
     parser.add_argument(
         "--arch-yaml",
         type=Path,
@@ -517,22 +464,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-regenerate-ert",
         action="store_true",
-        help="无论是否已有 ERT 文件，均强制调用 Accelergy 重新生成。",
+        help="兼容旧入口；默认已重新生成 ERT，显式复用请用 --ert-path。",
     )
     parser.add_argument(
         "--skip-python-energy-check",
         action="store_true",
-        help="跳过自研 normalized_energy_model 的能量校验（默认开启，仅打印）。",
+        help="跳过自研 normalized_energy_model 的能量校验（默认开启，检查目标与公式一致性）。",
+    )
+    parser.add_argument(
+        "--mip-gap",
+        type=float,
+        default=None,
+        help="覆盖 Gurobi 相对 MIP gap；未指定时默认使用 0（证明最优）。",
     )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    here = Path(__file__).resolve().parent
-    inputs_dir = args.inputs_dir
-    outputs_dir = args.outputs_dir
+    prepare_environment()
+    if args.mip_gap is not None and not 0.0 <= args.mip_gap <= 1.0:
+        raise ValueError("--mip-gap 必须位于 [0, 1]。")
+    here = PROJECT_ROOT
+    inputs_dir = args.inputs_dir.expanduser().resolve()
+    outputs_dir = args.outputs_dir.expanduser().resolve()
     timing_only = _env_flag(ENV_STAGE3_TIME_ONLY)
+
+    print("[Model] review1_bugfix")
 
     top_model = here / "top_model.jinja"
     arch_yaml = args.arch_yaml if args.arch_yaml is not None else (inputs_dir / "arch.yaml")
@@ -547,6 +505,9 @@ def main() -> int:
     if not problem_yaml.exists():
         raise FileNotFoundError(f"未找到 problem.yaml：{problem_yaml}")
 
+    generated_mapping = (outputs_dir / "mapping.yaml").resolve()
+    if generated_mapping in {arch_yaml.resolve(), problem_yaml.resolve(), (inputs_dir / "mapping.yaml").resolve()}:
+        raise ValueError("--outputs-dir would overwrite a source input; use a separate directory")
     jinja_parse_data = {
         # 让 top_model.jinja 优先从 inputs_dir 下找 mapping/variables/mapper/_components
         "inputs_dir": str(inputs_dir.resolve()),
@@ -571,18 +532,12 @@ def main() -> int:
             return 0
     else:
         ert_path = outputs_dir / "timeloop-model.ERT.yaml"
-        if args.force_regenerate_ert or not ert_path.exists():
-            print("[Stage1] 调用 Accelergy 生成 ERT …")
-            tmp_accelergy_dir = outputs_dir / "accelergy_tmp"
-            ert_path = _generate_ert_with_accelergy(
-                top_model,
-                tmp_accelergy_dir,
-                ert_path,
-                jinja_parse_data=jinja_parse_data,
-            )
-            print(f"[Stage1] ERT 已生成：{ert_path}")
-        else:
-            print(f"[Stage1] 复用已有 ERT：{ert_path}")
+        print("[Stage1] 调用 Accelergy 生成 ERT …")
+        ert_path = _generate_ert_with_accelergy(
+            top_model, outputs_dir / "accelergy_tmp", ert_path,
+            jinja_parse_data=jinja_parse_data,
+        )
+        print(f"[Stage1] ERT 已生成：{ert_path}")
         if args.generate_ert_only:
             print("[Stage1] generate-ert-only：ERT 已就绪，退出。")
             return 0
@@ -597,7 +552,11 @@ def main() -> int:
         ert_path,
         jinja_parse_data=jinja_parse_data,
     )
-    dev_params = _device_params_from_ert_path(ert_path, storage_width_datawidth=storage_width_datawidth)
+    dev_params = _device_params_from_ert_path(
+        ert_path,
+        storage_width_datawidth=storage_width_datawidth,
+        device_params_cls=energy_module.DeviceParams,
+    )
     cfg = _build_cfg(L0, C1, C3, N_PE, dev_params)
 
     print(f"[Stage2] L0 = {L0}, C1={C1}, C3={C3}, N_PE={N_PE} (meshX={mesh_x}, meshY={mesh_y})")
@@ -610,16 +569,40 @@ def main() -> int:
     )
 
     # --------------------
-    # 阶段 3：MILP 求解
+    # 阶段 3：MIQCP 求解
     # --------------------
-    print("[Stage3] 构建并求解 MILP 映射模型 …")
+    print("[Stage3] 构建并求解 MIQCP 映射模型 …")
     t_stage3 = time.perf_counter()
-    model, L, k, y, B1, B3, a01, a12 = _solve_full_model(cfg, verbose=True)
+    model, L, k, y, B1, B3, a01, a12 = _solve_full_model(
+        cfg,
+        build_model_full=optimizer_module.build_model_full,
+        verbose=True,
+        mip_gap=args.mip_gap,
+    )
     stage3_solve_seconds = time.perf_counter() - t_stage3
     timing_path = _write_stage3_timing(outputs_dir, stage3_solve_seconds)
     print(f"[Stage3] _solve_full_model() 耗时: {stage3_solve_seconds:.6f} s（已写入 {timing_path}）")
 
+    import gurobipy as gp
+    record = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "model_variant": "review1_bugfix", "gurobi_version": list(gp.gurobi.version()),
+        "python_version": sys.version, "cfg": cfg,
+        "solver_parameters": {name: getattr(model.Params, name) for name in (
+            "NonConvex", "IntegralityFocus", "IntFeasTol", "FeasibilityTol",
+            "NumericFocus", "DualReductions", "MIPGap")},
+        "solver": {"status": model.Status, "objective_dynamic_pJ_per_MAC": model.ObjVal,
+                   "bound_dynamic_pJ_per_MAC": model.ObjBound, "gap": model.MIPGap},
+        "stage3_solve_seconds": stage3_solve_seconds,
+        "source_sha256": {name: hashlib.sha256((here / name).read_bytes()).hexdigest()
+                          for name in ("full_model.py", "normalized_energy_model.py", "solver.py")},
+        "inputs": {name: {"path": str(path.resolve()),
+                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                   for name, path in (("architecture", arch_yaml), ("problem", problem_yaml), ("ERT", ert_path))},
+    }
+    (outputs_dir / "run_record.json").write_text(json.dumps(record, indent=2) + "\n")
     if timing_only:
+        model.dispose()
         print("[Stage3] timing-only：已完成 Stage3，跳过 Python 能量校验与 Stage4/5。")
         return 0
 
@@ -643,10 +626,11 @@ def main() -> int:
     print("  B1 =", B1_map)
     print("  B3 =", B3_map)
 
+    python_energy = None
     # 可选：用 Python 能量模型再算一遍，做 sanity check
     if not args.skip_python_energy_check:
         print("[Stage3] 使用自研 normalized_energy_model 做能量校验 …")
-        _check_python_energy(
+        python_energy = _check_python_energy(
             L0=L0,
             hatL_12=hatL_12,
             hatL_23=hatL_23,
@@ -656,6 +640,8 @@ def main() -> int:
             B1=B1_map,
             B3=B3_map,
             params=dev_params,
+            compute_normalized_total_energy=energy_module.compute_normalized_total_energy,
+            objective=float(model.ObjVal),
         )
 
     # --------------------
@@ -664,7 +650,7 @@ def main() -> int:
     print("[Stage4] 生成 Timeloop mapping.yaml（不改动 problem.yaml） …")
     problem_path, mapping_path = _update_problem_and_mapping(
         here,
-        inputs_dir,
+        outputs_dir,
         L0,
         hatL_01,
         hatL_12,
@@ -677,14 +663,29 @@ def main() -> int:
         mesh_x,
         mesh_y,
     )
-    print(f"[Stage4] 沿用已有 problem.yaml：{problem_path}")
+    jinja_parse_data["mapping"] = str(mapping_path.resolve())
+    print(f"[Stage4] 沿用已有 problem.yaml：{problem_yaml}")
     print(f"[Stage4] mapping.yaml 已更新：{mapping_path}")
 
     # --------------------
     # 阶段 5：Timeloop 评估
     # --------------------
     print("[Stage5] 调用 timeloop-model 做最终评估 …")
-    _run_timeloop_model(top_model, ert_path, outputs_dir, jinja_parse_data=jinja_parse_data)
+    timeloop_energy = _run_timeloop_model(top_model, ert_path, outputs_dir, jinja_parse_data=jinja_parse_data)
+    if python_energy is not None:
+        error = abs(python_energy - timeloop_energy)
+        match = error <= 1e-5 + 1e-6 * max(abs(python_energy), abs(timeloop_energy))
+    else:
+        error, match = None, None
+    record["energy"] = {
+        "units": "pJ/MAC", "python_total_including_leakage": python_energy,
+        "timeloop_total_including_leakage": timeloop_energy,
+        "absolute_error": error, "match": match, "atol": 1e-5, "rtol": 1e-6,
+    }
+    (outputs_dir / "run_record.json").write_text(json.dumps(record, indent=2) + "\n")
+    model.dispose()
+    if match is False:
+        raise RuntimeError(f"Python/Timeloop energy mismatch; see {outputs_dir / 'run_record.json'}")
 
     print("[Done] 映射求解与评估流程完成。")
     return 0

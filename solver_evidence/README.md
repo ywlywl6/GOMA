@@ -1,20 +1,18 @@
 # Solver formulation, scalability, and optimality evidence
 
-This directory contains supplementary solver records for the GOMA paper's
-`review1_bugfix` model. It supports the discussion of model size, the formulation
-passed to Gurobi, and concrete solver-level optimality certificates.
+This directory provides supplementary solver records for the GOMA paper:
+model sizes, the formulation passed to Gurobi, and solver-level optimality
+certificates. The supplied example can be reproduced directly from the exported
+model using the command below.
 
-**Code version:** these artifacts correspond to `review1_bugfix`. The existing
-`full_model.py`, `normalized_energy_model.py`, and `mapping_pipeline.py` at the
-repository root have not yet been synchronized with that revision. The exported
-model in this directory can be solved directly with Gurobi using the command
-below; it does not depend on those root-level implementations.
+The root-level implementation is now synchronized with the reviewed equations.
+Its current solve settings differ from the historical settings below; see
+[model notes](../MODEL_NOTES.md). The supplied records remain unchanged.
 
 ## Evaluation records
 
 The tables contain the **192 GEMM mapping instances in the main EDP experiment**:
-24 architecture–workload cases, with eight GEMM types per case. They contain only
-that experiment, rather than combining it with fixed-bypass or runtime reruns.
+24 architecture–workload cases, with eight GEMM types per case.
 
 | File | Contents |
 |---|---|
@@ -50,8 +48,7 @@ The main experiment used Gurobi 13.0.0 with:
 The CSV expands the last two defaults to their numeric values.
 `solver_seconds_log` is the solver wall time printed in the EDP experiment log;
 `stage3_seconds_log` includes model construction, solving, and reporting inside
-the Stage 3 function. These are **EDP-experiment timings**, separate from the
-local timing snapshot used to produce the paper's normalized Runtime figure.
+the Stage 3 function. The paper's Runtime figure uses a separate timing benchmark.
 
 ## Concrete optimality certificate
 
@@ -66,18 +63,14 @@ The example is the Q projection of Qwen3-32B at 128k context on A100-like:
 |---|---|
 | [practical_case_from_logs.json](practical_case_from_logs.json) | The original EDP example's inputs, mapping, solver fields, and analytical energy components |
 | [practical_case_original.log](practical_case_original.log) | Its original end-to-end EDP experiment log, including `Optimal solution found`, UB/LB, gap, and mapping |
-| [practical_case_current_model.lp](practical_case_current_model.lp) | Exported `review1_bugfix` MIQCP; the LP file format includes quadratic and indicator constraints |
+| [practical_case_current_model.lp](practical_case_current_model.lp) | Exported example MIQCP, including quadratic and indicator constraints |
 | [practical_case_current_solution.sol](practical_case_current_solution.sol) | Full variable assignment from a separate example rerun |
 | [practical_case_current_solver.log](practical_case_current_solver.log) | Gurobi log of that rerun |
 | [practical_case_current_solver_record.json](practical_case_current_solver_record.json) | Rerun inputs, version, parameters, full-precision solver attributes, and mapping variables |
 
-The rerun uses `NumericFocus=0` and `DualReductions=1`, matching the original
-experiment settings above. It additionally has a 60-second time limit for this
-standalone example. It returned `OPTIMAL` with `MIPGap=0`, explored 15,553 nodes,
-and reproduced the mapping in the original local Runtime log for this instance.
-The original EDP run returned another mapping with the same energy. Each log
-and its mapping are therefore presented as one complete record. The rerun's
-wall time is a new measurement, not a replacement for the paper's Runtime data.
+The standalone rerun uses the experiment settings above with a 60-second time
+limit. It returned `OPTIMAL` with `MIPGap=0`. The original experiment and the
+standalone rerun each include their own mapping and solver record.
 
 These records demonstrate the solver-level optimality certificate: a feasible
 mapping, solver status, incumbent upper bound, global lower bound, and final
@@ -88,7 +81,7 @@ gap, for the modeled problem under the solver's numerical tolerances.
 Use Python 3.12 and Gurobi 13.0.0 (`gurobipy`) to match the recorded version:
 
 ```bash
-# From the repository root:
+# From the GOMA repository root:
 python solver_evidence/reproduce_example.py
 ```
 
@@ -100,15 +93,5 @@ It leaves the supplied artifacts unchanged. To choose another output directory:
 python solver_evidence/reproduce_example.py --output-dir /tmp/goma-solver-example
 ```
 
-This directly exercises the exported formulation; it does not regenerate the
-model through the older root-level pipeline. Runtime and the particular mapping
-selected among equal-energy optima can depend on the execution environment.
-
-## Provenance
-
-The evaluation tables were prepared from the original
-`outputs_mapping_pipeline/review1_bugfix/edp_evaluation/` logs in the paper
-experiment workspace. The example model and rerun artifacts were prepared on
-2026-09-05 using `goma/variants/review1_bugfix/optimizer.py`. The original example
-log retains the source experiment's paths; the reproduction script uses only
-files shipped in this directory.
+The script solves the supplied formulation using only files in this directory.
+Runtime and the mapping selected among equal-energy optima may vary across runs.

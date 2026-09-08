@@ -1,0 +1,11 @@
+# 03_attn_score.yaml
+# Q * K^T
+# GQA Flattened Mapping 应用于此处
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    # GQA Stacked X: SeqLen(131072) * (Hq/Hkv)(8) = 1048576
+    X: 1048576
+    Y: 131072  # Key SeqLen
+    Z: 128     # Head Dim (注意：70B 的 Head Dim 增大到了 128)

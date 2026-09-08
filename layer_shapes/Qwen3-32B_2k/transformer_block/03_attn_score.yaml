@@ -1,0 +1,11 @@
+# 03_attn_score.yaml
+# 说明: Q * K^T 计算相关性
+# GQA Ratio = 8
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    # GQA 映射: X = SeqLen(2048) * Ratio(8) = 16384
+    X: 16384
+    Y: 2048    # SeqLen (Key Length - Updated)
+    Z: 128     # Head Dim

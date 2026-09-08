@@ -1,0 +1,10 @@
+# 01_attn_q_proj.yaml
+# 说明: 生成 Query 矩阵
+# 维度: Hidden(5120) -> Heads(64) * Dim(128) = 8192
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 2048    # Sequence Length (Updated)
+    Z: 5120    # Input (Hidden Size)
+    Y: 8192    # Output (Total Q Heads 64 * Dim 128)

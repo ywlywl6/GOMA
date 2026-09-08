@@ -1,0 +1,10 @@
+# 01_attn_q_proj.yaml
+# 说明: 生成 Query 矩阵
+# 特殊: Qwen3-0.6B 此处为升维投影 (1024 -> 16*128=2048)
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 1024    # Sequence Length
+    Z: 1024    # Input (Hidden Size)
+    Y: 2048    # Output (Total Q Heads 16 * Dim 128)

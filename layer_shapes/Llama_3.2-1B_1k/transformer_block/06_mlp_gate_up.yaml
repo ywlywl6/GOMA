@@ -1,0 +1,10 @@
+# 06_mlp_gate_up.yaml
+# 说明: SwiGLU 的升维操作 (Gate + Up)
+# 注意: 包含 Gate_Proj 和 Up_Proj，计算总耗时/能耗时，该 Workload 需要执行 2 次。
+{{include_text('../../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 1024
+    Z: 2048    # Input
+    Y: 8192    # Intermediate Size (4x Hidden)

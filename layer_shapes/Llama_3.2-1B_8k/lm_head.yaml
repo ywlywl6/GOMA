@@ -1,0 +1,10 @@
+# 08_lm_head.yaml
+# 说明: 词表映射，预测下一个 Token
+# 关键: 推理时只需要对最后一个 Token 进行预测，所以 X=1
+{{include_text('../matrix_base.yaml')}}
+problem:
+  <<<: *matrix_base
+  instance:
+    X: 1       # 强制为 1 (Last Token Slice)
+    Z: 2048    # Hidden Size
+    Y: 128256  # Vocab Size (Llama 3 特有的超大词表)

@@ -14,5 +14,5 @@ components:
 variables:    {{include('variables.yaml', 'variables')}}
 problem:      {{include(problem|default('problem.yaml'), 'problem')}}
 
-mapping:  {{include('mapping.yaml', 'mapping')}}
+mapping:  {{include(mapping|default('mapping.yaml'), 'mapping')}}
 mapper:       {{include('mapper.yaml', 'mapper')}}

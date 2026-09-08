@@ -1,0 +1,8 @@
+order,yaml_file,repeat
+01,01_attn_q_proj.yaml,1
+02,02_attn_kv_proj.yaml,2
+03,03_attn_score.yaml,8
+04,04_attn_context.yaml,8
+05,05_attn_output.yaml,1
+06,06_mlp_gate_up.yaml,2
+07,07_mlp_down.yaml,1
