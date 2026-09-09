@@ -76,18 +76,18 @@ is retained for compatibility; regeneration is already the default.
 
 ## Tools and files
 
-| Entry | Purpose |
-|---|---|
-| `full_model.py` | Optimizer; exposes `build_model_full(cfg, params=...)` and its eight-element return tuple |
-| `normalized_energy_model.py` | Independent dynamic/total energy and traffic evaluator |
-| `solver.py` | Shared current solver settings, incumbent checks and integer mapping extraction |
-| `mapping_pipeline.py` | Single-layer optimization and Timeloop evaluation |
-| `gen_problem_mapping.py` | Problem/mapping conversion, including two-dimensional PE meshes |
-| `dataflow_gen.py`, `tilings_random.json` | Existing random-tiling database and dataflow enumeration |
-| `validate_energy_flow.py` | Python/Timeloop energy comparison for the bundled Eyeriss dataflows |
-| `run_model_any.py`, `run_mapper_any.py` | Standalone Timeloop model/mapper utilities |
-| `inspect_spec.py` | Inspect default architecture/problem and the ERT in `outputs_my/` |
-| `architecture/`, `inputs_my/`, `templates/` | Architecture descriptions, example inputs, components and YAML templates |
+| Entry                                       | Purpose                                                                                   |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `full_model.py`                             | Optimizer; exposes `build_model_full(cfg, params=...)` and its eight-element return tuple |
+| `normalized_energy_model.py`                | Independent dynamic/total energy and traffic evaluator                                    |
+| `solver.py`                                 | Shared current solver settings, incumbent checks and integer mapping extraction           |
+| `mapping_pipeline.py`                       | Single-layer optimization and Timeloop evaluation                                         |
+| `gen_problem_mapping.py`                    | Problem/mapping conversion, including two-dimensional PE meshes                           |
+| `dataflow_gen.py`, `tilings_random.json`    | Existing random-tiling database and dataflow enumeration                                  |
+| `validate_energy_flow.py`                   | Python/Timeloop energy comparison for the bundled Eyeriss dataflows                       |
+| `run_model_any.py`, `run_mapper_any.py`     | Standalone Timeloop model/mapper utilities                                                |
+| `inspect_spec.py`                           | Inspect default architecture/problem and the ERT in `outputs_my/`                         |
+| `architecture/`, `inputs_my/`, `templates/` | Architecture descriptions, example inputs, components and YAML templates                  |
 
 Replay a generated mapping, or invoke Timeloop's mapper:
 
@@ -107,8 +107,7 @@ directory; their defaults are relative to the script directory.
 
 Validation copies inputs under its output directory, reuses one ERT/ART pair,
 preserves measured errors in CSV/JSONL, and fails if any selected case fails.
-The criterion is `abs_err <= 1e-5 + 1e-6 * max(abs(E_python), abs(E_timeloop))`,
-with energy in pJ/MAC including leakage. `--atol` and `--rtol` override these values.
+ `--atol` and `--rtol` override these values.
 Use a new, empty output directory; `--start` and `--limit` select a subset.
 Without `--limit`, the bundled database expands to 8064 Timeloop evaluations.
 A different architecture requires a compatible tiling database with matching PE count.
