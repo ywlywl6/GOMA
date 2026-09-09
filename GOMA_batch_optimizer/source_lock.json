@@ -1,0 +1,19 @@
+{
+  "reviewed_commit": "b4015e465d78a8dbeb25ec9220cfe7c34883a865",
+  "commit_time_utc": "2026-09-08T09:27:06Z",
+  "repository": "ywlywl6/GOMA",
+  "expected_git_blob_sha1": {
+    "full_model.py": "8979f7b0c2812ea3b5012d27b748e900e4938f65",
+    "normalized_energy_model.py": "67195293bb88906047ffbcb4c629a812fdb2c350"
+  },
+  "production_integration": "Load both main-root modules from explicit --goma-root; no source modifications.",
+  "test_snapshot": "tests/upstream/normalized_energy_model.py is byte-identical and retains upstream MIT license.",
+  "validation_status": {
+    "python_tests_passed": 30,
+    "gurobi_tests_skipped": 6,
+    "mapping_evaluator_checks": 48444,
+    "gurobi_backend_executed": false,
+    "timeloop_executed": false,
+    "large_end_to_end_benchmark_executed": false
+  }
+}

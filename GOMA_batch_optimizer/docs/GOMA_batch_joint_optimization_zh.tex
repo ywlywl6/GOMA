@@ -1,0 +1,405 @@
+% Compile twice with XeLaTeX. The original GOMA files are not modified.
+\documentclass[UTF8,11pt,a4paper,fontset=fandol]{ctexart}
+\usepackage[margin=23mm,headheight=15pt]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs,array,tabularx,longtable}
+\usepackage{enumitem}
+\usepackage{xcolor,fancyhdr,fvextra}
+\usepackage[hidelinks,unicode]{hyperref}
+\definecolor{ink}{HTML}{18344A}
+\definecolor{muted}{HTML}{596771}
+\ctexset{section={format=\Large\bfseries\color{ink}},subsection={format=\large\bfseries\color{ink}}}
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\small\sffamily GOMA / Batch Joint Optimization}
+\fancyhead[R]{\small\sffamily 建模与实现补充}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\setlength{\parindent}{2em}\setlength{\parskip}{3pt}
+\setlength{\emergencystretch}{2em}
+\setlist{nosep,leftmargin=2em}
+\newcommand{\GOMA}{\textsc{GOMA}}
+\newcommand{\NN}{\mathbb N}
+\newcommand{\LB}{\mathrm{LB}}
+\newcommand{\UB}{\mathrm{UB}}
+\newcommand{\ind}[1]{\mathbf 1[#1]}
+\newtheorem{proposition}{命题}[section]
+\newtheorem{theorem}[proposition]{定理}
+\theoremstyle{remark}\newtheorem{remark}[proposition]{说明}
+\renewcommand{\proofname}{证明}
+\numberwithin{equation}{section}
+\hypersetup{pdftitle={GOMA Batch-level 联合优化：自适应配置生成与直接 MIQCP},pdfauthor={GOMA project extension},pdfsubject={Source-integrated implementation and verified optimization bounds}}
+\begin{document}
+\begin{center}
+{\small\sffamily\color{muted} GOMA IMPLEMENTATION NOTE \quad | \quad 2026-09-08}\par\vspace{8pt}
+{\LARGE\bfseries\color{ink} GOMA Batch-level 联合优化}\par\vspace{5pt}
+{\large 自适应配置生成、直接 MIQCP 与混合求解}\par\vspace{9pt}
+\end{center}
+\begin{abstract}
+本文是 \texttt{GOMA\_batch\_extension\_zh} 的独立建模与实现补充。保留每个 batch 的原三维 GEMM mapping，直接集成指定 main 版本的解析模型与 Gurobi 模型。面向实际求解，提供两条完整路径：一是同时优化并发槽位资源和 mapping 的直接联合 MIQCP，通过最小 PE 数的离散选择把 EDP 写成线性条件目标，不新增能量--延迟双线性耦合；二是使用真实 mapping 形成上界目录、使用覆盖全部容量域的区间松弛形成下界目录，再由配置重数 MILP 联合选择并行度和资源分区，按需调用原 GOMA。默认混合方案把少量联合求解得到的可行配置和有效下界反馈给自适应主问题。实现包含模型复用、缓存、整数与能量重算、超时界管理及复现实验接口。已执行验证覆盖 48,444 个 mapping 的当前解析模型核对、外层分配对照及边界测试；Gurobi 后端和大型端到端性能比较尚未在本次环境中执行。
+\end{abstract}
+
+\section{定位、基线与实现选择}
+\label{sec:decision}
+前一扩展\cite{batch}已给出周期调度的延迟定理、容量单调性、配置下包络和资源非均分反例。本文不重复建立这些基础，也不修改原文档；新增的是\emph{可直接实现的联合模型、在下包络不完整时仍然有效的全局界，以及工程求解路径}。
+
+源码基线固定为用户指定仓库 main 的提交
+\begin{center}\small\ttfamily b4015e465d78a8dbeb25ec9220cfe7c34883a865\end{center}
+其提交时间为 2026-09-08 09:27:06 UTC。
+根目录 {\small\texttt{normalized\_energy\_model.py}} 和 {\small\texttt{full\_model.py}} 分别是本实现实际调用的解析求值器和原 Gurobi 模型\cite{commit,energy,full}。原模型以 normalized dynamic energy 为目标，包含 MACC，不含作为固定报告项的漏电；source/receiver 分别计费，并保留跨 SRAM-tile 的 regfile residency\cite{full,energy}。
+
+\paragraph{默认选择。}
+采用 \texttt{hybrid}：自适应配置生成作为主体，必要时对小 q 做有限预算的直接联合探测。同时提供关闭联合探测的 \texttt{adaptive} 和独立的 \texttt{joint}。选择理由是，同形 batch 的单 mapping 子问题可以共享计算结果，而把所有并发槽位复制到一个非凸模型中会随 q 增长；另一方面，容量竞争也可能使联合模型获得更强的界，因此不排除其成为某些实例的更好路径。\emph{这是结构驱动的工程选择，不是尚未进行的大型实测结论。}
+
+\paragraph{源码集成边界。}
+正式求解不使用前一文档的小规模枚举器。运行时从显式的 \texttt{--goma-root} 加载原文件并验证 Git blob hash。单 batch oracle 复用一个原模型；联合后端通过 Gurobi API 复制原约束到多个 block。代码不改写原 Python 文件、不以文本替换重造流量公式。测试目录中的精确原 evaluator 快照仅用于离线核验，并保留原 MIT 许可。
+
+\section{统一变量与归一化目标}
+\label{sec:objective}
+令总 SRAM 为 $C=C_1$、总 PE 为 $N$、每 PE 的 RF 容量为 $C_3$。共有 B 个独立同形 GEMM，每个计算量 $V=XYZ$。并行度 $q\mid B$，一轮内资源固定，所有槽位完成后再开始下一轮。不考虑跨 batch 数据共享、contention 或调度开销；每 PE 每周期执行一次 MAC，且没有执行停顿。
+
+对单 batch mapping $m$，直接使用原解析模型的目标
+\begin{equation}
+\phi(m)=\frac{E_{\mathrm{dyn}}(m)}{V},\qquad
+f(c,n)=\min_{m\in\mathcal M(c,n)}\phi(m).
+\label{eq:phi}
+\end{equation}
+因此，前一文档的非归一化 $F(c,n)$ 等于 $Vf(c,n)$。实际 SRAM footprint 为
+\begin{equation}
+h(m)=\sum_{d\in\{x,y,z\}} B_d^{(1)}\prod_{u\ne d}L_u^{(1)}.
+\end{equation}
+由于固定 ERT 下未使用容量不产生额外动态访问，约束 $\sum_b c_b=C$ 可等价替换为 $\sum_b h(m_b)\le C$；返回结果时把未使用额度分给一个槽位即可恢复额度等式\cite{batch}。
+
+设 $n_b$ 为槽位 b 精确使用的 PE 数，$s=\min_b n_b$，$S=\sum_b\phi(m_b)$。每 PE 的 C3 不分割。可选的整机漏电为
+\begin{equation}
+P=\ell_1+N\ell_3\quad\text{或在关闭漏电时取 }P=0,
+\end{equation}
+其中 $\ell_1$ 是整个物理 SRAM 每周期漏电，$\ell_3$ 是每个 PE 的 RF 每周期漏电。由前一扩展的延迟结果\cite{batch}，
+\begin{equation}
+T=\frac{BV}{qs},\qquad
+E=\frac{BV}{q}\left(S+\frac{P}{s}\right).
+\label{eq:physical}
+\end{equation}
+实现采用两种全局归一化目标：
+\begin{align}
+J_E&:=\frac{E}{BV}=\frac{S}{q}+\frac{P}{qs},\label{eq:JE}\\
+J_D&:=\frac{N\,EDP}{B^2V^2}
+=\frac{N}{q^2s}S+\frac{NP}{q^2s^2}.
+\label{eq:JD}
+\end{align}
+每个固定问题中的缩放因子为正，因此不改变最优解。MACC 项在 $J_D$ 中不能删除，因为它乘以可能随分区改变的总延迟。
+
+\paragraph{候选域。}
+记 $\mathcal D_V=\{n:n\mid V,\ 1\le n\le N\}$，候选 q 为 B 的正约数，满足 $q\le N$ 和 $qV\ge N$。实现仅对 $(q,s)$ 做安全必要筛选，如 $qs\le N$、$N\le s+(q-1)\max\mathcal D_V$；精确 PE 装配由主问题或联合模型处理，不预设 PE 或 SRAM 必须均分。
+
+\section{直接联合 MIQCP}
+\label{sec:joint}
+\subsection{将原 GOMA 作为可复制的 mapping block}
+令 $\mathcal G(C,C_3;n_b)$ 表示原 \texttt{full\_model.py} 的全部 mapping/辅助变量和约束，只将固定 PE 关系改为
+\begin{equation}
+v_b=k_{x,b}^{(2)}k_{y,b}^{(2)},\qquad
+v_bk_{z,b}^{(2)}=n_b,\quad n_b\in\NN_+.
+\label{eq:joint-pe}
+\end{equation}
+所有层级整除、容量门控、reciprocal、walking-axis、cross-level reuse、receiver/source traffic 和规约边界关系保持原样；$\phi_b$ 是原线性能量表达式。对固定 q，基础联合可行域是
+\begin{equation}
+\begin{aligned}
+&m_b\in\mathcal G(C,C_3;n_b),\\
+&\sum_{b=1}^q n_b=N,\\
+&\sum_{b=1}^q h(m_b)\le C.
+\end{aligned}
+\label{eq:joint-base}
+\end{equation}
+原每 block 的 SRAM 容量上界 C 保留为冗余有效约束；$C_3$ 仍逐 PE 约束。内部 $n_b\mid V$ 由分层整数倍率和式~\eqref{eq:joint-pe} 自动保证。可额外用合法 PE 约数的 one-hot 表示加强整数域；无需枚举 tiling 或 SRAM 分区。
+
+实现复用原 SRAM 缩放：$\sigma=\max\{1,\sqrt C\}$。由原 occupied-scaled 变量组成 $H_b=h(m_b)/\sigma$，共享约束是 $\sum_bH_b\le C/\sigma$，避免把巨大 word footprint 直接作为额外非线性目标系数。
+
+\subsection{对称性缩减与实际最小 PE 数}
+同形、独立的槽位可同时置换全部资源和 mapping，故可加入
+\begin{equation}
+n_1\le n_2\le\cdots\le n_q.
+\label{eq:sort}
+\end{equation}
+因此 $s=n_1$，不需要一般的 $\min$ 或 $\max$ 约束。同 PE 数的相邻槽位再按 footprint 非降排列；这只是选取等价排列代表，不要求这些槽位的容量或 mapping 相同。
+
+\subsection{EDP 的线性条件目标：不新增双线性耦合}
+令 $\mathcal S_q=\{s\in\mathcal D_V:qs\le N\}$。为第一个槽位引入二进制选择 $\xi_s$：
+\begin{equation}
+\sum_{s\in\mathcal S_q}\xi_s=1,\qquad
+n_1=\sum_{s\in\mathcal S_q}s\xi_s.
+\label{eq:min-selector}
+\end{equation}
+由式~\eqref{eq:sort}，它选中的就是实际最小 PE 数。能量目标可写为
+\begin{equation}
+\min\ \frac1q\sum_b\phi_b+\frac{P}{q}\sum_{s\in\mathcal S_q}\frac{\xi_s}{s}.
+\label{eq:joint-energy}
+\end{equation}
+对于 EDP，引入 epigraph 变量 t，最小化 t，并施加线性 indicator constraints：
+\begin{equation}
+\xi_s=1\ \Longrightarrow\
+t\ge\frac{N}{q^2s}\sum_b\phi_b+\frac{NP}{q^2s^2},
+\quad s\in\mathcal S_q.
+\label{eq:joint-edp}
+\end{equation}
+这里 $q,N,P,s$ 都是当前约束的常数，$\sum_b\phi_b$ 是原 block 的线性表达式。
+
+\begin{proposition}[联合目标的等价性]
+固定 q 时，式~\eqref{eq:joint-base}--\eqref{eq:joint-edp} 与原周期调度类中联合优化全部资源和 mapping 的 EDP 问题等价。
+\end{proposition}
+\begin{proof}
+任一原解可按 PE 数排序，并激活其最小 PE 对应的 $\xi_s$；式~\eqref{eq:joint-edp} 的活跃右端恰为 $J_D$。反之，one-hot 和排序保证所选 s 是实际最小 PE 数，每个 block 的 mapping 都合法；最小化 t 时，活跃 epigraph 的最优值等于该可行解的 $J_D$。容量额度由 footprint 补齐恢复。
+\end{proof}
+
+这比直接写 $t\ge S/s$ 更适合当前实现：没有新增 reciprocal 非凸等式，也没有新增能量与延迟的连续双线性乘积。模型仍是原 mapping blocks 驱动的 non-convex MIQCP，不能因此称为 ILP。该方案用 Gurobi 的原生 indicator API 表达\cite{gurobi-api}。
+
+\paragraph{q 的处理与界。}
+\texttt{joint} 在允许的 q 约数集合上求解上述模型，而不把 B 个可能槽位全部创建成带开关的大模型。每个固定 q 的模型内部仍是\emph{真正的联合优化}。记其有效下界为 $L_q$，所有可行解的最好目标为 U，则完整问题下界为 $\min_q L_q$。尚未求解、超时或超出用户模型规模限制的 q 保留解析下界，不删除。默认最大联合槽位数 64 是资源保护，不是数学可行域的隐式限制。
+
+\section{带完整下界覆盖的自适应配置生成}
+\label{sec:adaptive}
+\subsection{为何不先生成所有下包络}
+完整容量--能量下包络再做重数 ILP 是精确方法\cite{batch}，但前置工作会为所有合法 PE 数求解全部必要容量平台，其中许多不会出现在最优或有竞争力的分区中。本文保留该理论结构，但把完整目录生成改为\emph{下界候选驱动的按需查询}。
+
+仅有一个不完整的可行配置目录时，其最优目标是原问题的上界，不能当作全局下界。为此，需要同时维护两种不同语义的目录。
+
+\subsection{上界目录：真实 mapping 配置}
+已验证 mapping 形成
+\begin{equation}
+\mathcal K_U=\{j:(n_j,a_j,e_j,m_j)\},\qquad
+ a_j=h(m_j),\ e_j=\phi(m_j).
+\end{equation}
+每个配置都由原解析模型重算能量，并检查整数倍率、walking-axis、PE 数和两级容量。对相同 n，删除 footprint 不小且能量不低的配置；不同 n 不能直接作这种替换，因为总 PE 是等式约束。上界主问题的任一可行重数组合都对应真实 schedule。
+
+\subsection{下界目录：容量区间而非虚构的 mapping}
+对每个 $n\in\mathcal D_V$，维护覆盖全部整数容量 $[0,C]$ 的不重叠 cells。cell i 记录
+\begin{equation}
+(n_i,l_i,u_i,\beta_i),\qquad \beta_i\le f(u_i,n_i).
+\label{eq:cell}
+\end{equation}
+利用容量非增性，对于任意 $c\in[l_i,u_i]$，有
+\begin{equation}
+f(c,n_i)\ge f(u_i,n_i)\ge\beta_i.
+\label{eq:cell-lower}
+\end{equation}
+因而可以用乐观配置 $(n_i,l_i,\beta_i)$ 表示该 cell：下界主问题只收费 $l_i$ words，能量只收取 $\beta_i$。这不是可执行 mapping，只是容量/能量的有效松弛。初始化每种 n 的 cell 为 $[0,C]$，使用必需 IO 下界
+\begin{equation}
+\phi_{\mathrm{IO}}=R_0\left(\frac1X+\frac1Y\right)+\frac{W_0}{Z}+e^{\mathrm{MACC}}.
+\label{eq:IO}
+\end{equation}
+它来自两张输入各至少读一次、结果至少写一次和全部 MAC；与前一扩展的非归一化 IO 下界一致\cite{batch}。
+
+\begin{theorem}[完整域下界]
+只要每种 n 的所有整数容量始终由满足式~\eqref{eq:cell}的 cells 覆盖，则这些乐观配置的重数优化给出原 batch 联合优化问题的有效下界。
+\end{theorem}
+\begin{proof}
+取任一真实可行解的容量额度 $c_b$、PE 数 $n_b$ 和 mapping $m_b$。为每个槽位选择覆盖 $c_b$ 的对应 cell，则 $l_i\le c_b$，且 $\beta_i\le f(c_b,n_b)\le\phi(m_b)$。替换后保留原 q、所有 n 以及实际最小 PE 数 s，容量需求不增加、轮能量不增加。式~\eqref{eq:JE}--\eqref{eq:JD} 中的能量系数为正，漏电项不变，故乐观目标不高于真实目标。取最优值即得结论。
+\end{proof}
+
+\subsection{查询与平台跳跃}
+下界最优候选包含未决 cell $[l,u]$ 时，调用原 GOMA 求解 $f(u,n)$。如果它取得最优解，能量为 $e^*$、实际 footprint 为 h，则
+\begin{equation}
+f(c,n)=e^*\quad\text{对全部 }h\le c\le u\text{ 成立}.
+\label{eq:plateau}
+\end{equation}
+因为返回 mapping 在该区间均可行，而容量单调性给出反方向不等式。由此将 $[\max(l,h),u]$ 标记为已解平台；若 $h>l$，保留 $[l,h-1]$，并继承新下界。原 mapping 加入上界目录。
+
+不要求以 footprint 为第二目标重新求解一次；任一最优 witness 都给出正确平台，只是 footprint 更小可能跨过更长区间。实现默认省去这次额外优化。
+
+\paragraph{未取得最优解。}
+若查询超时，仅用其真实 ObjBound 提高 cell 下界，并把经过重算的 incumbent 加入上界目录。\emph{不得根据 incumbent 宣布平台成立，也不得删除尚未搜索的容量。}重复选中同一未决端点时，查询预算逐步增加，但受总预算限制。
+
+\paragraph{理想有限终止与数值实践。}
+精确子问题求解时，每次对未决 cell 的查询至少证明一个整数容量点，全部域有限；若下界候选仅使用已解平台，则这些配置有相应可行 witness，并可以闭合上下界。最坏情况下仍可能遍历大量容量点，不存在本文已证明的普适多项式时间保证。浮点求解器下，已解 cell 的有效下界与重算能量仍可能有残余数值差异；实现保留该差异并报告 gap，不把它强行置零。
+
+\section{统一配置重数 MILP}
+\label{sec:master}
+上、下界目录使用同一主问题结构，只是输入配置的语义不同。任一配置记为 $(n_j,a_j,e_j)$；真实目录中是 footprint 和能量，下界目录中是 cell 的左端点和下界。
+
+令 $\mathcal I$ 为通过必要筛选的 $(q,s)$ 集合。对每个 $(q,s)$，令 $y_{qs}\in\{0,1\}$ 表示选中该分支，$z_{qsj}\in\NN_0$ 表示配置重数，配置仅取 $n_j\ge s$ 且 $n_j\le N-(q-1)s$。约束为
+\begin{align}
+\sum_{(q,s)\in\mathcal I}y_{qs}&=1,\\
+\sum_jz_{qsj}&=q y_{qs},\label{eq:master-count}\\
+\sum_jn_jz_{qsj}&=N y_{qs},\\
+\sum_ja_jz_{qsj}&\le C y_{qs},\\
+\sum_{j:n_j=s}z_{qsj}&\ge y_{qs},\qquad 0\le z_{qsj}\le q.
+\label{eq:master-min}
+\end{align}
+最后一条确保至少出现一个恰好使用 s 个 PE 的槽位，故 s 不是宽松下限。未激活分支的所有 z 自动为零。
+
+对应分支的线性目标为
+\begin{align}
+g^E_{qs}&=\frac1q\sum_je_jz_{qsj}+\frac{P}{qs}y_{qs},\\
+g^D_{qs}&=\frac{N}{q^2s}\sum_je_jz_{qsj}+\frac{NP}{q^2s^2}y_{qs}.
+\label{eq:master-cost}
+\end{align}
+最小化所有分支目标之和，即联合选择 q、实际最小 PE 数及配置重数的一个 MILP。它不是先固定均分再调 mapping，也不为每个已执行 batch 建变量。
+
+\subsection{融合联合 MIQCP 的 q 级下界}
+若直接联合模型获得有效 $L_q$，为下界主问题引入 $w_{qs}\ge0$：
+\begin{equation}
+w_{qs}\ge g_{qs},\qquad w_{qs}\ge L_qy_{qs},\qquad
+\min\sum_{q,s}w_{qs}.
+\label{eq:master-epigraph}
+\end{equation}
+真实解的目标同时不小于 cell 松弛和 $L_q$，故取二者最大值仍是有效下界。对于没有联合求解的 q，使用零或已有解析下界；证实不可行的 q 可以移除。联合求解得到的所有真实 mapping 也可跨 q 重用到上界目录。
+
+\subsection{主问题求解器与规模}
+默认通过 SciPy 的 \texttt{milp} 调用 HiGHS，也提供 Gurobi MILP 后端。两者均使用实际 dual bound，而不是仅凭成功状态把 incumbent 当作精确下界；SciPy 的 \texttt{mip\_dual\_bound} 与 \texttt{mip\_gap} 专门保留这些字段\cite{scipy}。
+
+若当前目录大小为 K，主问题变量量级为
+\begin{equation}
+O\left(\sum_{(q,s)\in\mathcal I}|\mathcal K_{qs}|+|\mathcal I|\right),
+\qquad |\mathcal K_{qs}|\le K.
+\end{equation}
+它不会按 C 的每个 word 或 B 个已执行 batch 展开；但 K、合法 PE 约数和 $(q,s)$ 分支过多时，主问题也可能成为瓶颈。直接联合模型约为 q 份原模型加离散 PE 域与共享约束。两种方法各自的规模驱动不同，不能只看 GEMM MAC 数判断运行时间。
+
+\section{快速证书、实现流程与数值边界}
+\label{sec:implementation}
+\subsection{q=1 与一次可变 PE 下界查询}
+当 $N\mid V$，求 q=1 的原 GOMA 映射作为基线。再把同一单 batch 模型的 PE 变量释放到 $1\le n\le N$，以满 SRAM C 求解
+\begin{equation}
+f_{\mathrm{free}}=\min_{n\in\mathcal D_V}f(C,n).
+\end{equation}
+不需要为每个 PE 数分别先查询满容量。若获得下界 $\beta\le f_{\mathrm{free}}$，则任意槽位均有 $\phi(m_b)\ge\beta$。因此全问题下界至少为
+\begin{equation}
+\min_{(q,s)\in\mathcal I} J(q,s,S=q\beta),
+\label{eq:free-lb}
+\end{equation}
+其中 J 取式~\eqref{eq:JE}或~\eqref{eq:JD}。q=1 的可行目标若达到该界即可终止。这个证书不假设能量对精确 PE 数单调，也不假设均分最优。可变 PE 查询只提供有效下界；即使超时也可利用它的 ObjBound。
+
+\subsection{默认工作流}
+\begin{enumerate}
+\item 检查输入、源码哈希、合法 PE 域及候选 $(q,s)$；用少量全 bypass mapping 构造初始可行目录。
+\item 可行时求 q=1，并进行一次可变 PE 的满容量下界查询；检查全局 gap。
+\item 求真实目录上界主问题和完整容量覆盖下界主问题；只查询当前下界候选中未决 cell 的端点。
+\item \texttt{hybrid} 默认每 12 次迭代，对尚未探测且 $2\le q\le8$ 的当前竞争分支做一次有限预算联合求解；吸收其真实配置与 $L_q$。
+\item 达到 gap、时间或迭代限制时输出最佳 schedule、完整域界、所有求解记录及未决信息。
+\end{enumerate}
+初始 mapping 对每种合法 n 只构造至多六种按轴次序分配空间因数的全 bypass 方案并选择较低能量者；并不枚举全部 mapping。每种合法 n 都至少有一个可行零 footprint witness，因此初始目录足以覆盖所有可装配 PE 分区的可行性。
+
+\subsection{原模型复用与缓存}
+\texttt{GurobiOracle} 只创建一个原 GOMA block。后续查询更新 SRAM 容量约束 RHS，并固定或释放 PE 整数变量。缓存键包括配置、两个源码哈希、Gurobi 版本、有效求解参数及适配器版本；读取缓存时再次用原 evaluator 验证 mapping。只有已取得最优结果的缓存可直接替代同端点优化；超时结果不能被缓存标记升级为最优。
+
+原模型采用 \texttt{NonConvex=2}；oracle 设置 \texttt{MIPGap=0}、\texttt{MIPGapAbs=0}，并沿用严格可行性/整数容差。参数中相对与绝对 gap 的含义不同，二者均应控制\cite{gurobi-params}。局部严格求解是平台推断的条件；外层仍可在用户所需非零 gap 下提前结束。
+
+\subsection{证书与错误处理}
+所有可行 mapping 在整数容差检查后提取，重新验证层级乘积、有效行走轴、容量和 PE，再用原解析模型计算动态能量。独立重算值决定可行上界；求解器的真实 bound 决定下界。若重算能量与 solver objective 的差异超出允许范围，或下界明显高于已知可行值，则报错而不是隐藏差异。
+
+默认全局终止条件为
+\begin{equation}
+U-L\le\max\{\epsilon_{\rm abs},\epsilon_{\rm rel}|U|\},
+\quad \epsilon_{\rm rel}=10^{-6},\ \epsilon_{\rm abs}=10^{-9},
+\label{eq:gap}
+\end{equation}
+其中绝对容差使用归一化目标单位。状态 \texttt{GAP\_CERTIFIED} 表示\emph{整个周期调度域}的数值界满足式~\eqref{eq:gap}，而不是有理数精确证明。实际 solver status、raw objective、ObjBound、gap 均保留。未完成查询、未决 q 或数值残余不能变成虚假的零 gap。
+
+\subsection{软件边界与资源限制}
+默认主问题使用 HiGHS，正式 oracle 与联合后端使用 Gurobi；Python 本身不替代非凸求解器。联合模型随 q 增长可能超出 size-limited license，\texttt{hybrid} 检测该许可错误后可关闭联合探测并继续自适应路径；其他未知异常不静默吞掉。墙钟预算包含建模和调度，但不是硬实时中断保证。
+
+本实现不导出未经验证的真实并发硬件执行方案。返回的是当前理想模型下的 PE/SRAM 分区、mapping、周期和能量；Timeloop/Accelergy、真实通信带宽和分区硬件可实现性仍需对应工具验证。
+
+\section{已执行验证}
+\label{sec:validation}
+\subsection{验证环境及明确范围}
+本次实际环境为 Python 3.13.5、NumPy 2.3.5、SciPy 1.17.0，未安装可用的 Gurobi Python 后端。因此正式 Gurobi oracle、直接联合 MIQCP 和三种路径的大型端到端比较未在本次执行。以下测试使用真实当前原 evaluator、真实 HiGHS 主问题，以及\emph{测试专用的完整小规模配置目录 oracle}，不以其冒充 Gurobi 性能。
+
+\subsection{与当前 main 原解析模型逐点核对}
+使用前一扩展的参考枚举器生成全部受测合法参数配置，对每一个配置调用当前 main 的原 evaluator；测试用 evaluator 文件的 Git blob 为
+\begin{center}\small\ttfamily 67195293bb88906047ffbcb4c629a812fdb2c350\end{center}
+与仓库源文件逐字节相同。结果如下，计数包含物理等价表示：
+\begin{center}\small
+\begin{tabular}{lrrrrr}
+\toprule
+$(X,Y,Z)$ & $C_3$ & $C_{\max}$ & $N_{\max}$ & 合法配置 & 下包络配置\\
+\midrule
+$(1,16,1)$ & 1 & 2 & 16 & 240 & 5\\
+$(2,2,2)$ & 1 & 16 & 8 & 1984 & 7\\
+$(4,4,4)$ & 1 & 32 & 8 & 33212 & 16\\
+$(2,4,4)$ & 1 & 32 & 8 & 13008 & 12\\
+\midrule
+合计 & & & & 48444 & 40\\
+\bottomrule
+\end{tabular}
+\end{center}
+这些配置的最大总能量差异为零。能量参数为人工整数 ERT：DRAM 读写各 100、SRAM 各 10、RF 各 1、MACC 为 1；这不是新的一组硬件测量或 Timeloop fidelity 实验。
+
+\subsection{外层优化及边界验证}
+用完整目录提供精确 $f(c,n)$，让 \texttt{adaptive} 自行查询所需端点；将其结果与独立、完整的资源分配 DP 对照。四个输入分别运行 energy 与 EDP，共八组，两种目标在这些小例上返回相同结果：
+\begin{center}\small
+\begin{tabular}{llrrrr}
+\toprule
+case & $(B,N,C)$ & q & 总能量 & 总周期 & EDP\\
+\midrule
+scalar & $(2,2,2)$ & 2 & 6666 & 16 & 106656\\
+threshold & $(2,4,6)$ & 1 & 2440 & 4 & 9760\\
+nondivisible & $(2,6,6)$ & 2 & 2560 & 4 & 10240\\
+leakage & $(4,8,16)$ & 1 & 13248 & 16 & 211968\\
+\bottomrule
+\end{tabular}
+\end{center}
+输入详情和每步界见包内 JSON/CSV。scalar 复现 $q=1$ 非普遍最优；nondivisible 中 $N\nmid V$，但 $(2,4)$ PE 分区可行；leakage 按整机每周期 10 的漏电计费。所有八组均与独立 DP 相同，并检查每步下界不超过真实最优值。
+
+\paragraph{非均分反例的作用域。}
+前一文档的 threshold 反例固定 $q=2$ 且每个槽位 $n=2$，此时 SRAM 非均分得到 2960，低于均分的 3240。本文完整外层还允许改变 q，因而在同一硬件与形状下选择 $q=1$、能量 2440。两者不矛盾；固定分支内的非均分收益不能直接解释成完整问题一定选择 batch 并行。
+
+\paragraph{单元与集成测试。}
+实际运行结果为 \textbf{30 passed、6 skipped}。通过项包含上述小例、100 组随机主问题与完整 DP 对照、30 组随机自适应界检查、超时不得关闭平台、残余数值 gap、漏电、零容量、源码 hash 及大 B 不展开测试。六个 Gurobi 集成测试因后端缺失跳过，涵盖原单 GEMM 与 q=1 联合模型对照、可变 PE oracle 与缓存，以及三个 q=2 联合模型与完整目录对照。它们已给出可执行代码，但不计为已通过。
+
+\subsection{规模化验证的边界}
+已执行一个 master-only 检查：$4096^3$ GEMM、$B=16$、$N=256$、$C=65536$，输入九个便宜构造的全 bypass 配置，主问题包含 183 个变量。该结果仅说明重数主问题无需展开全部 MAC 或 B 个实例；\emph{不是完整大 GEMM mapping 求解，也不是 hybrid/joint 的性能比较}。
+
+完整 Gurobi 验证与性能比较通过配套 \texttt{tools/benchmark.py} 运行，采用相同预算、独立冷缓存、新进程和固定线程设置。应同时比较可行解质量、完整域 gap、oracle 次数、主问题规模和墙钟时间，而不能只比较哪种方法返回的 status 是 optimal。
+
+\clearpage
+\section{交付代码与复现方式}
+\label{sec:reproduce}
+代码包在一个独立目录下组织：
+\begin{center}\small
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+模块 & 职责\\
+\midrule
+\texttt{core.py} & 问题输入、归一化目标、资源检查、紧凑 schedule\\
+\texttt{upstream.py} & 原模型加载、hash、单 block oracle、能量重算、缓存\\
+\texttt{master.py} & 同时选择 q、s、配置重数的上/下界 MILP\\
+\texttt{adaptive.py} & 完整容量域覆盖、平台跳跃、上下界与混合调度\\
+\texttt{joint.py} & 约束复制、资源耦合、最小 PE 条件目标、联合求解\\
+\texttt{cli.py} & 统一命令行、日志、数值界与 JSON 结果\\
+\texttt{tests/} & 小规模参考、当前 evaluator 快照、回归/集成测试\\
+\texttt{tools/} & 固定版本下载、验证脚本、等预算真实后端 benchmark\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+安装并运行默认方案：
+\begin{Verbatim}[fontsize=\small,breaklines=true]
+cd GOMA_batch_optimizer
+python -m pip install -e ".[solver,test]"
+python -m goma_batch examples/scalar.json --goma-root /path/to/GOMA --method hybrid --seconds 300 --output outputs/scalar_hybrid
+\end{Verbatim}
+将 \texttt{--method} 换成 \texttt{adaptive} 或 \texttt{joint} 即运行另外两条路径。输入 JSON 的 cfg 保持原 GOMA 命名，额外给出 B、objective 和 leakage；示例文件均为人工 ERT，真实实验应替换为原项目的 workload 与对应固定 ERT。
+
+运行测试与真实后端比较：
+\begin{Verbatim}[fontsize=\small,breaklines=true]
+python -m pytest -q
+python tools/verify_small.py
+python -m pytest -q --goma-root /path/to/GOMA
+python tools/benchmark.py examples/scalar.json examples/large_synthetic.json --goma-root /path/to/GOMA --seconds 300 --repeats 3 --threads 1 --output real_backend_benchmark
+\end{Verbatim}
+
+\texttt{result.json} 返回紧凑的 allocation groups：重数、精确 PE 数、实际 footprint、补齐后的 C1 quota、mapping 和能量分解；同时返回轮数、总能量、周期、EDP、数值 UB/LB/gap、方法和源码哈希。每次实际 oracle 的日志与原始求解器界分别保存。正式运行不需要枚举 batch 标签，也不需要更改原模型接口。
+
+\section{结论}
+本文把前一理论扩展推进为两条可接入现有项目的正式求解路径。直接联合 MIQCP 在固定 q 内同时优化资源与全部 mapping，并利用最小 PE 数的有限域避免额外的 EDP 非凸耦合；自适应方案把实际 mapping 上界与完整容量域下界分开，避免先求完整下包络，且在查询未完成时仍能保留全局证书的正确语义。默认 hybrid 让两条路径共享真实配置和有效界。
+
+当前交付已包括实现、独立形式化、小规模当前模型核验和真实后端测试接口。大型实例上哪种方法最好，仍由相同源码、ERT、预算和许可环境下的端到端 benchmark 决定，而不是由方案名称或模型形式预先保证。
+
+\begin{thebibliography}{9}
+\bibitem{batch} GOMA 项目扩展，\emph{GOMA 的 Batch-level 扩展：外层资源分配、周期性调度与可证明的搜索缩减}，用户提供的 \texttt{GOMA\_batch\_extension\_zh(1).txt}，2026-09-08。
+\bibitem{commit} GOMA repository，\href{https://github.com/ywlywl6/GOMA/commit/b4015e465d78a8dbeb25ec9220cfe7c34883a865}{固定 main 提交 b4015e4：Update GOMA models, standalone workflows, and LLM workloads}，2026-09-08。
+\bibitem{full} GOMA，\href{https://github.com/ywlywl6/GOMA/blob/b4015e465d78a8dbeb25ec9220cfe7c34883a865/full_model.py}{根目录 full\_model.py，固定提交版本}。
+\bibitem{energy} GOMA，\href{https://github.com/ywlywl6/GOMA/blob/b4015e465d78a8dbeb25ec9220cfe7c34883a865/normalized_energy_model.py}{根目录 normalized\_energy\_model.py，固定提交版本}。
+\bibitem{gurobi-api} Gurobi Optimization，\href{https://docs.gurobi.com/projects/optimizer/en/current/reference/python/model.html}{Gurobi Python Model class reference}，约束查询、复制与 indicator API，访问日期 2026-09-08。
+\bibitem{gurobi-params} Gurobi Optimization，\href{https://docs.gurobi.com/projects/optimizer/en/current/reference/parameters.html}{Parameter Reference}，MIPGap、MIPGapAbs、NonConvex 等，访问日期 2026-09-08。
+\bibitem{scipy} SciPy，\href{https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.milp.html}{scipy.optimize.milp reference}，HiGHS 接口与 dual-bound 返回值，访问日期 2026-09-08。
+\end{thebibliography}
+\end{document}

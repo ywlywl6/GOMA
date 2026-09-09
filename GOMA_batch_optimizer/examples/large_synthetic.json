@@ -1,0 +1,25 @@
+{
+  "cfg": {
+    "L0": {
+      "x": 4096,
+      "y": 4096,
+      "z": 4096
+    },
+    "C1": 65536,
+    "C3": 64,
+    "N_PE": 256,
+    "E_DDR_r": 100,
+    "E_DDR_w": 100,
+    "E_SRAM_r": 10,
+    "E_SRAM_w": 10,
+    "E_RF_r": 1,
+    "E_RF_w": 1,
+    "E_MACC": 1,
+    "E_SRAM_leak": 0,
+    "E_RF_leak": 0
+  },
+  "B": 16,
+  "objective": "edp",
+  "leakage": false,
+  "note": "Synthetic ERT; not a measured hardware benchmark."
+}
